@@ -64,12 +64,12 @@ local INTERNAL = {
     TARGET_LOST_TICK = 0.20,
     FARM_TICK_MIN = 0.03,
     TELEPORT_SEGMENT_MAX = 95,
-    TELEPORT_SEGMENT_WAIT = 0.012,
+    TELEPORT_SEGMENT_WAIT = 0.0,
     LONG_TELEPORT_THRESHOLD = 16,
     MIN_POSITION_EPSILON = 1.25,
     REPOSITION_THRESHOLD = 2.75,
     HARD_REPOSITION_THRESHOLD = 5.5,
-    TELEPORT_COOLDOWN_MIN = 0.05,
+    TELEPORT_COOLDOWN_MIN = 0.0,
     EQUIP_COOLDOWN = 0.25,
     HOLD_POSITION_P = 100000,
     HOLD_POSITION_D = 1450,
@@ -920,7 +920,7 @@ end
 
 function CombatController.getAttackCooldown()
     local cd = tonumber(Config.AttackDelay) or 0.12
-    return math.clamp(cd, 0.03, 0.6)
+    return math.clamp(cd, 0, 0.6)
 end
 
 function CombatController.tryActivateTool()
@@ -1137,7 +1137,9 @@ function MovementController.getTargetCFrameForNPC(npc)
 end
 
 function MovementController.getTeleportCooldown()
-    return math.max(INTERNAL.TELEPORT_COOLDOWN_MIN, math.min(Config.TPDelay, 0.18))
+    local d = tonumber(Config.TPDelay) or 0
+    d = math.max(0, d)
+    return math.max(INTERNAL.TELEPORT_COOLDOWN_MIN, d)
 end
 
 function MovementController.shouldReposition(targetCF)
@@ -1838,100 +1840,112 @@ end
 function FarmController.step()
     local acquiredNewTarget = false
 
-    if not FarmController.isEnabled() then
-        FarmController.clearTarget()
-        MovementController.syncHoldState()
-        return INTERNAL.IDLE_TICK
-    end
+    for attempt = 1, 2 do
+        acquiredNewTarget = false
 
-    if not refreshCharacterRefs() or not hum or not hrp or hum.Health <= 0 then
-        MovementController.syncHoldState()
-        return INTERNAL.IDLE_TICK
-    end
-
-    if not State.connections.NoClip or not State.connections.NoClipDesc then
-        CharacterController.enableNoClip()
-    end
-
-    if State.activeTarget and not FarmController.shouldKeepTarget(State.activeTarget) then
-        local died = not NPCController.isAlive(State.activeTarget)
-        FarmController.clearTarget()
-
-        if died then
+        if not FarmController.isEnabled() then
+            FarmController.clearTarget()
             MovementController.syncHoldState()
-            return (tonumber(Config.Delay) or 0) > 0 and Config.Delay or 0
+            return INTERNAL.IDLE_TICK
         end
-    end
 
-    if not State.activeTarget then
-        FarmController.acquireTarget(true, State.lastCycleSkip)
-        acquiredNewTarget = State.activeTarget ~= nil
-    elseif (os.clock() - State.lastTargetRefreshAt) >= INTERNAL.NPC_CACHE_TTL then
-        NPCController.refreshCache(true)
-        State.lastTargetRefreshAt = os.clock()
-
-        if not FarmController.shouldKeepTarget(State.activeTarget) then
-            FarmController.clearTarget()
-            FarmController.acquireTarget(false, State.lastCycleSkip)
-            acquiredNewTarget = State.activeTarget ~= nil
+        if not refreshCharacterRefs() or not hum or not hrp or hum.Health <= 0 then
+            MovementController.syncHoldState()
+            return INTERNAL.IDLE_TICK
         end
-    end
 
-    if State.activeTarget and Config.CycleTargets then
-        local now = os.clock()
-        local interval = math.clamp(tonumber(Config.CycleInterval) or 2.5, 0.35, 30)
-        if (now - (State.lastCycleAt or 0)) >= interval then
-            State.lastCycleAt = now
-            State.lastCycleSkip = State.activeTarget
+        if not State.connections.NoClip or not State.connections.NoClipDesc then
+            CharacterController.enableNoClip()
+        end
+
+        if State.activeTarget and not FarmController.shouldKeepTarget(State.activeTarget) then
+            local died = not NPCController.isAlive(State.activeTarget)
             FarmController.clearTarget()
+
+            if died then
+                -- Immediately move to the next target (no post-kill stall).
+                MovementController.syncHoldState()
+            end
+        end
+
+        if not State.activeTarget then
             FarmController.acquireTarget(true, State.lastCycleSkip)
             acquiredNewTarget = State.activeTarget ~= nil
+        elseif (os.clock() - State.lastTargetRefreshAt) >= INTERNAL.NPC_CACHE_TTL then
+            NPCController.refreshCache(true)
+            State.lastTargetRefreshAt = os.clock()
+
+            if not FarmController.shouldKeepTarget(State.activeTarget) then
+                FarmController.clearTarget()
+                FarmController.acquireTarget(false, State.lastCycleSkip)
+                acquiredNewTarget = State.activeTarget ~= nil
+            end
         end
+
+        if State.activeTarget and Config.CycleTargets then
+            local now = os.clock()
+            local interval = math.clamp(tonumber(Config.CycleInterval) or 2.5, 0.35, 30)
+            if (now - (State.lastCycleAt or 0)) >= interval then
+                State.lastCycleAt = now
+                State.lastCycleSkip = State.activeTarget
+                FarmController.clearTarget()
+                FarmController.acquireTarget(true, State.lastCycleSkip)
+                acquiredNewTarget = State.activeTarget ~= nil
+            end
+        end
+
+        if not State.activeTarget then
+            MovementController.syncHoldState()
+            return 0
+        end
+
+        if Config.AutoEquip then
+            EquipController.equipSelected(false)
+        end
+
+        local targetCF = FarmController.refreshTargetLock(false)
+        if not targetCF then
+            FarmController.clearTarget()
+            MovementController.setHoldState(false)
+            MovementController.syncHoldState()
+            return 0
+        end
+
+        if acquiredNewTarget then
+            MovementController.setHoldState(false)
+            targetCF = FarmController.refreshTargetLock(true) or targetCF
+            MovementController.safePivotTo(targetCF, true)
+        end
+
+        if MovementController.shouldUseHold() then
+            MovementController.setHoldState(true, targetCF)
+        elseif State.holdEnabled then
+            MovementController.setHoldState(false)
+        end
+
+        MovementController.moveToward(targetCF)
+
+        CombatController.tryActivateTool()
+
+        if State.holdEnabled and State.activeTargetLockCF then
+            MovementController.updateHoldTarget(State.activeTargetLockCF)
+        end
+
+        if State.activeTarget and not NPCController.isAlive(State.activeTarget) then
+            -- Kill confirmed: clear and immediately attempt to acquire and move to next target.
+            FarmController.clearTarget()
+            MovementController.setHoldState(false)
+            MovementController.syncHoldState()
+            if attempt < 2 then
+                continue
+            end
+            return 0
+        end
+
+        return 0
     end
 
-    if not State.activeTarget then
-        MovementController.syncHoldState()
-        return FarmController.getStepDelay(false)
-    end
-
-    if Config.AutoEquip then
-        EquipController.equipSelected(false)
-    end
-
-    local targetCF = FarmController.refreshTargetLock(false)
-    if not targetCF then
-        FarmController.clearTarget()
-        MovementController.setHoldState(false)
-        MovementController.syncHoldState()
-        return FarmController.getStepDelay(false)
-    end
-
-    if acquiredNewTarget then
-        MovementController.setHoldState(false)
-        targetCF = FarmController.refreshTargetLock(true) or targetCF
-        MovementController.safePivotTo(targetCF, true)
-    end
-
-    if MovementController.shouldUseHold() then
-        MovementController.setHoldState(true, targetCF)
-    elseif State.holdEnabled then
-        MovementController.setHoldState(false)
-    end
-
-    MovementController.moveToward(targetCF)
-
-    CombatController.tryActivateTool()
-
-    if State.holdEnabled and State.activeTargetLockCF then
-        MovementController.updateHoldTarget(State.activeTargetLockCF)
-    end
-
-    if not NPCController.isAlive(State.activeTarget) then
-        FarmController.clearTarget()
-        return (tonumber(Config.Delay) or 0) > 0 and Config.Delay or 0
-    end
-
-    return FarmController.getStepDelay(true)
+    return 0
 end
 
 function UIController.refreshNPCDropdowns(force)
@@ -2221,7 +2235,7 @@ function UIController.create()
         Title = "Teleport Delay",
         Desc = "Float supported",
         Step = 0.01,
-        Value = { Min = 0.01, Max = 0.5, Default = Config.TPDelay },
+        Value = { Min = 0, Max = 0.5, Default = Config.TPDelay },
         Flag = "tp_delay",
         Callback = function(value)
             Config.TPDelay = value
@@ -2315,7 +2329,7 @@ function UIController.create()
     combatSection:Toggle({
         Title = "Bypass TP",
         Desc = "Uses small mid-steps on long teleports",
-        Value = true,
+        Value = Config.BypassTP,
         Flag = "bypass_tp",
         Callback = function(state)
             Config.BypassTP = state
@@ -2389,7 +2403,7 @@ function UIController.create()
         Title = "Attack Delay",
         Desc = "How fast to activate the tool",
         Step = 0.01,
-        Value = { Min = 0.03, Max = 0.6, Default = Config.AttackDelay },
+        Value = { Min = 0, Max = 0.6, Default = Config.AttackDelay },
         Flag = "attack_delay",
         Callback = function(value)
             Config.AttackDelay = value
