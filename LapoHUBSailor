@@ -181,15 +181,34 @@ local function getPivotCFrame(obj)
 end
 
 local function getNPCFolder()
+    local function findFolderByName(name)
+        if not name or name == "" then
+            return nil
+        end
+
+        local direct = Workspace:FindFirstChild(name)
+        if direct and direct:IsA("Folder") then
+            return direct
+        end
+
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            if inst:IsA("Folder") and inst.Name == name then
+                return inst
+            end
+        end
+
+        return nil
+    end
+
     if Config.NPCFolderName then
-        local folder = Workspace:FindFirstChild(Config.NPCFolderName)
+        local folder = findFolderByName(Config.NPCFolderName)
         if folder then
             return folder
         end
     end
 
-    for _, name in ipairs({ "NPCs", "Enemies", "Mobs" }) do
-        local folder = Workspace:FindFirstChild(name)
+    for _, name in ipairs({ "NPCs", "NPC", "Npcs", "Enemies", "Mobs" }) do
+        local folder = findFolderByName(name)
         if folder then
             return folder
         end
@@ -271,7 +290,12 @@ local function isCombatNPC(model)
 end
 
 local function isTimedBoss(model)
-    return model and TIMED_BOSS_LOOKUP[model.Name] == true or false
+    if not model then
+        return false
+    end
+
+    local name = cleanName(model.Name)
+    return TIMED_BOSS_LOOKUP[name] == true
 end
 
 local function isBoss(model)
@@ -318,8 +342,11 @@ local function scanCombatNPCs()
     end
 
     if folder then
-        for _, inst in ipairs(folder:GetDescendants()) do
-            addModel(inst)
+        for _, child in ipairs(folder:GetChildren()) do
+            addModel(child)
+            for _, inst in ipairs(child:GetDescendants()) do
+                addModel(inst)
+            end
         end
     else
         for _, inst in ipairs(Workspace:GetDescendants()) do
@@ -652,10 +679,6 @@ local function isProtectedWorkspaceRoot(root)
         return true
     end
 
-    if root:IsA("Terrain") then
-        return true
-    end
-
     if State.Character and (root == State.Character or root:IsDescendantOf(State.Character)) then
         return true
     end
@@ -664,7 +687,8 @@ local function isProtectedWorkspaceRoot(root)
         return true
     end
 
-    if root:IsA("Model") and getHumanoid(root) then
+    local npcFolder = getNPCFolder()
+    if npcFolder and (root == npcFolder or root:IsDescendantOf(npcFolder)) then
         return true
     end
 
@@ -676,14 +700,34 @@ local function hideRoot(root)
         return
     end
 
+    local npcFolder = getNPCFolder()
+
     for _, inst in ipairs(root:GetDescendants()) do
+        if npcFolder and inst:IsDescendantOf(npcFolder) then
+            continue
+        end
+
         if inst:IsA("BasePart") then
             remember(inst, "LocalTransparencyModifier")
+            remember(inst, "Transparency")
+            remember(inst, "CastShadow")
             inst.LocalTransparencyModifier = 1
+            inst.Transparency = 1
+            inst.CastShadow = false
         elseif inst:IsA("Decal") or inst:IsA("Texture") then
             remember(inst, "Transparency")
             inst.Transparency = 1
-        elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") then
+        elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")
+            or inst:IsA("Smoke") or inst:IsA("Fire") or inst:IsA("Sparkles") then
+            remember(inst, "Enabled")
+            inst.Enabled = false
+        elseif inst:IsA("PointLight") or inst:IsA("SpotLight") or inst:IsA("SurfaceLight") then
+            remember(inst, "Enabled")
+            inst.Enabled = false
+        elseif inst:IsA("Highlight") then
+            remember(inst, "Enabled")
+            inst.Enabled = false
+        elseif inst:IsA("BillboardGui") or inst:IsA("SurfaceGui") then
             remember(inst, "Enabled")
             inst.Enabled = false
         end
@@ -691,7 +735,11 @@ local function hideRoot(root)
 
     if root:IsA("BasePart") then
         remember(root, "LocalTransparencyModifier")
+        remember(root, "Transparency")
+        remember(root, "CastShadow")
         root.LocalTransparencyModifier = 1
+        root.Transparency = 1
+        root.CastShadow = false
     end
 end
 
