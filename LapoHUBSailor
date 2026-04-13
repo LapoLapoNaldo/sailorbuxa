@@ -39,7 +39,9 @@ local Config = {
     TeleportHeight = 2.5,
     EquipCooldown = 0.25,
     AirHoldPosName = "LapoAirHoldPos",
-    AirHoldGyroName = "LapoAirHoldGyro"
+    AirHoldGyroName = "LapoAirHoldGyro",
+
+    NPCFolderName = "NPCs"
 }
 
 local State = {
@@ -97,12 +99,26 @@ local function isAliveNPC(model)
         return false
     end
 
+    if string.find(model.Name, "TrainingDummy") then
+        return false
+    end
+
     local hum = model:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then
         return false
     end
 
     return getModelRoot(model) ~= nil
+end
+
+local function getNPCFolder()
+    if Config.NPCFolderName then
+        local folder = Workspace:FindFirstChild(Config.NPCFolderName)
+        if folder then
+            return folder
+        end
+    end
+    return nil
 end
 
 local function isBoss(model)
@@ -118,10 +134,27 @@ end
 
 local function scanNPCs()
     local list = {}
+    local folder = getNPCFolder()
+    local seen = {}
 
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        if inst:IsA("Model") and isAliveNPC(inst) then
-            table.insert(list, inst)
+    if folder then
+        for _, inst in ipairs(folder:GetDescendants()) do
+            if inst:IsA("Model") and isAliveNPC(inst) then
+                local parentModel = inst.Parent
+                if parentModel and parentModel:IsA("Model") and parentModel:FindFirstChildOfClass("Humanoid") then
+                    continue
+                end
+                if not seen[inst] then
+                    seen[inst] = true
+                    table.insert(list, inst)
+                end
+            end
+        end
+    else
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            if inst:IsA("Model") and isAliveNPC(inst) then
+                table.insert(list, inst)
+            end
         end
     end
 
