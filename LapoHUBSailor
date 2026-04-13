@@ -58,34 +58,36 @@ local HOLD_GYRO_NAME = "Lapo_AirGyro"
 
 local INTERNAL = {
     NPC_CACHE_TTL = 0.35,
-    TARGET_CF_REFRESH = 0.12,
+    TARGET_CF_REFRESH = 0.08,
     STATUS_REFRESH = 0.60,
-    IDLE_TICK = 0.25,
-    TARGET_LOST_TICK = 0.20,
-    FARM_TICK_MIN = 0.03,
-    TELEPORT_SEGMENT_MAX = 95,
+    IDLE_TICK = 0.20,
+    TARGET_LOST_TICK = 0.10,
+    FARM_TICK_MIN = 0.01,
+    TELEPORT_SEGMENT_MAX = 120,
     TELEPORT_SEGMENT_WAIT = 0.0,
     LONG_TELEPORT_THRESHOLD = 16,
-    MIN_POSITION_EPSILON = 1.25,
-    REPOSITION_THRESHOLD = 2.75,
-    HARD_REPOSITION_THRESHOLD = 5.5,
+    MIN_POSITION_EPSILON = 0.85,
+    REPOSITION_THRESHOLD = 1.2,
+    HARD_REPOSITION_THRESHOLD = 3.0,
     TELEPORT_COOLDOWN_MIN = 0.0,
-    EQUIP_COOLDOWN = 0.25,
+    EQUIP_COOLDOWN = 0.20,
     HOLD_POSITION_P = 100000,
     HOLD_POSITION_D = 1450,
     HOLD_GYRO_P = 100000,
     HOLD_GYRO_D = 1250,
     SPAWN_CACHE_TTL = 8.0,
+    ORBIT_REFRESH = 0.03,
+    SAME_PACK_RADIUS = 18,
 }
 
 local Config = {
-    Delay = 0.45,
-    TPDelay = 0.05,
+    Delay = 0.03,
+    TPDelay = 0.01,
     BypassTP = false,
     InfiniteRangeTP = true,
     AutoAttack = true,
-    AttackDelay = 0.12,
-    CycleTargets = true,
+    AttackDelay = 0.05,
+    CycleTargets = false,
     CycleInterval = 2.5,
 
     SelectedEnemies = {},
@@ -108,6 +110,11 @@ local Config = {
     FreezeOnFPSBoost = true,
 
     ThemeName = "Midnight Emerald",
+    PreferPackCenter = true,
+    PackOrbit = true,
+    OrbitRadius = 5.5,
+    OrbitSpeed = 2.8,
+    OrbitHeight = 0.0,
 }
 
 local State = {
@@ -126,6 +133,9 @@ local State = {
     lastAttackAt = 0,
     lastCycleAt = 0,
     lastCycleSkip = nil,
+    lastKillAt = 0,
+    lastOrbitAt = 0,
+    orbitAngle = 0,
 
     holdEnabled = false,
     holdTargetCF = nil,
@@ -705,6 +715,68 @@ function NPCController.getDistanceFromCharacter(model)
     return (hrp.Position - root.Position).Magnitude
 end
 
+function NPCController.getAlivePack(baseName, referencePosition)
+    local result = {}
+    local normalizedBase = NPCController.normalizeKey(baseName)
+
+    for _, npc in ipairs(NPCController.getValidNPCs(false)) do
+        if NPCController.normalizeKey(NPCController.getBaseName(npc.Name)) == normalizedBase then
+            table.insert(result, npc)
+        end
+    end
+
+    if referencePosition and #result > 1 then
+        local filtered = {}
+
+        for _, npc in ipairs(result) do
+            local root = NPCController.getRoot(npc)
+            if root and (root.Position - referencePosition).Magnitude <= INTERNAL.SAME_PACK_RADIUS then
+                table.insert(filtered, npc)
+            end
+        end
+
+        if #filtered > 0 then
+            result = filtered
+        end
+    end
+
+    return result
+end
+
+function NPCController.getPackCenter(baseName, referencePosition)
+    local pack = NPCController.getAlivePack(baseName, referencePosition)
+    if #pack == 0 then
+        return nil, nil, 0
+    end
+
+    local sum = Vector3.zero
+    local count = 0
+    local nearestRoot = nil
+    local nearestDist = math.huge
+
+    for _, npc in ipairs(pack) do
+        local root = NPCController.getRoot(npc)
+        if root then
+            sum += root.Position
+            count += 1
+
+            if referencePosition then
+                local dist = (root.Position - referencePosition).Magnitude
+                if dist < nearestDist then
+                    nearestDist = dist
+                    nearestRoot = root
+                end
+            end
+        end
+    end
+
+    if count == 0 then
+        return nil, nil, 0
+    end
+
+    return (sum / count), nearestRoot, count
+end
+
 function NPCController.findNearestValidAny()
     local best = nil
     local bestDist = math.huge
@@ -919,8 +991,8 @@ function EquipController.equipSelected(force)
 end
 
 function CombatController.getAttackCooldown()
-    local cd = tonumber(Config.AttackDelay) or 0.12
-    return math.clamp(cd, 0, 0.6)
+    local cd = tonumber(Config.AttackDelay) or 0.08
+    return math.clamp(cd, 0, 0.4)
 end
 
 function CombatController.tryActivateTool()
@@ -1107,6 +1179,14 @@ function MovementController.syncHoldState()
     MovementController.setHoldState(false)
 end
 
+function MovementController.getOrbitAngle()
+    local now = os.clock()
+    local dt = math.max(0, now - (State.lastOrbitAt or now))
+    State.lastOrbitAt = now
+    State.orbitAngle = (State.orbitAngle + ((tonumber(Config.OrbitSpeed) or 0) * dt * math.pi * 2)) % (math.pi * 2)
+    return State.orbitAngle
+end
+
 function MovementController.getTargetCFrameForNPC(npc)
     if not NPCController.isValid(npc) then
         return nil
@@ -1132,14 +1212,41 @@ function MovementController.getTargetCFrameForNPC(npc)
         focusPosition = pivot.Position
     end
 
-    local targetPosition = sourceCF.Position - (sourceCF.LookVector * Config.DistanceBehind) + Vector3.new(0, Config.HeightOffset, 0)
-    return CFrame.new(targetPosition, focusPosition)
+    local baseName = State.activeTargetBaseName or NPCController.getBaseName(npc.Name)
+    local packCenter, nearestRoot, packCount = nil, nil, 0
+
+    if Config.PreferPackCenter and baseName ~= "" then
+        packCenter, nearestRoot, packCount = NPCController.getPackCenter(baseName, focusPosition)
+    end
+
+    if packCenter then
+        focusPosition = packCenter
+        if nearestRoot then
+            sourceCF = nearestRoot.CFrame
+        end
+    end
+
+    local finalPos
+
+    if Config.PackOrbit and packCount > 1 then
+        local angle = MovementController.getOrbitAngle()
+        local radius = math.max(1.5, tonumber(Config.OrbitRadius) or 5.5)
+        local orbitOffset = Vector3.new(
+            math.cos(angle) * radius,
+            Config.HeightOffset + (tonumber(Config.OrbitHeight) or 0),
+            math.sin(angle) * radius
+        )
+        finalPos = focusPosition + orbitOffset
+    else
+        finalPos = sourceCF.Position - (sourceCF.LookVector * Config.DistanceBehind) + Vector3.new(0, Config.HeightOffset, 0)
+    end
+
+    return CFrame.new(finalPos, focusPosition)
 end
 
 function MovementController.getTeleportCooldown()
     local d = tonumber(Config.TPDelay) or 0
-    d = math.max(0, d)
-    return math.max(INTERNAL.TELEPORT_COOLDOWN_MIN, d)
+    return math.clamp(d, 0, 0.5)
 end
 
 function MovementController.shouldReposition(targetCF)
@@ -1157,7 +1264,7 @@ function MovementController.shouldReposition(targetCF)
         return true
     end
 
-    return not State.holdEnabled and distance >= (INTERNAL.MIN_POSITION_EPSILON * 2)
+    return not State.holdEnabled
 end
 
 function MovementController.safePivotTo(targetCF, force)
@@ -1203,14 +1310,14 @@ function MovementController.safePivotTo(targetCF, force)
     if Config.BypassTP and distance > INTERNAL.LONG_TELEPORT_THRESHOLD then
         local currentPosition = hrp.Position
         local finalPosition = targetCF.Position
-        local steps = math.clamp(math.ceil(distance / INTERNAL.TELEPORT_SEGMENT_MAX), 1, 10)
+        local steps = math.clamp(math.ceil(distance / INTERNAL.TELEPORT_SEGMENT_MAX), 1, 12)
 
-        for index = 1, (steps - 1) do
+        for i = 1, (steps - 1) do
             if not State.alive or not char or not char.Parent then
                 break
             end
 
-            local alpha = index / steps
+            local alpha = i / steps
             local stepPosition = currentPosition:Lerp(finalPosition, alpha)
             local stepCF = CFrame.new(stepPosition, finalPosition)
 
@@ -1220,13 +1327,16 @@ function MovementController.safePivotTo(targetCF, force)
             pcall(function()
                 char:PivotTo(stepCF)
             end)
+
             MovementController.zeroVelocity()
 
             if State.holdEnabled then
                 MovementController.updateHoldTarget(stepCF)
             end
 
-            task.wait(INTERNAL.TELEPORT_SEGMENT_WAIT)
+            if INTERNAL.TELEPORT_SEGMENT_WAIT > 0 then
+                task.wait(INTERNAL.TELEPORT_SEGMENT_WAIT)
+            end
         end
     end
 
@@ -1810,7 +1920,6 @@ function FarmController.acquireTarget(forceRefresh, exclude)
 end
 
 function FarmController.refreshTargetLock(force)
-    -- If we're on a spawn fallback target (no model), keep using the stored CFrame.
     if not State.activeTarget then
         return State.activeTargetLockCF
     end
@@ -1829,11 +1938,10 @@ function FarmController.refreshTargetLock(force)
     return State.activeTargetLockCF
 end
 
-function FarmController.getStepDelay(activeTargetExists)
-    if activeTargetExists then
-        return math.max(INTERNAL.FARM_TICK_MIN, Config.TPDelay)
+function FarmController.getStepDelay(hasTargetLock)
+    if hasTargetLock then
+        return math.max(INTERNAL.FARM_TICK_MIN, tonumber(Config.TPDelay) or 0)
     end
-
     return INTERNAL.TARGET_LOST_TICK
 end
 
@@ -1863,22 +1971,28 @@ function FarmController.step()
             FarmController.clearTarget()
 
             if died then
-                -- Immediately move to the next target (no post-kill stall).
+                State.lastKillAt = os.clock()
+                MovementController.setHoldState(false)
                 MovementController.syncHoldState()
+
+                local delayAfterKill = math.max(0, tonumber(Config.Delay) or 0)
+                if delayAfterKill > 0 then
+                    return delayAfterKill
+                end
             end
         end
 
-        if not State.activeTarget then
+        if not State.activeTarget and not State.activeTargetLockCF then
             FarmController.acquireTarget(true, State.lastCycleSkip)
-            acquiredNewTarget = State.activeTarget ~= nil
-        elseif (os.clock() - State.lastTargetRefreshAt) >= INTERNAL.NPC_CACHE_TTL then
+            acquiredNewTarget = State.activeTarget ~= nil or State.activeTargetLockCF ~= nil
+        elseif State.activeTarget and (os.clock() - State.lastTargetRefreshAt) >= INTERNAL.NPC_CACHE_TTL then
             NPCController.refreshCache(true)
             State.lastTargetRefreshAt = os.clock()
 
             if not FarmController.shouldKeepTarget(State.activeTarget) then
                 FarmController.clearTarget()
                 FarmController.acquireTarget(false, State.lastCycleSkip)
-                acquiredNewTarget = State.activeTarget ~= nil
+                acquiredNewTarget = State.activeTarget ~= nil or State.activeTargetLockCF ~= nil
             end
         end
 
@@ -1890,31 +2004,30 @@ function FarmController.step()
                 State.lastCycleSkip = State.activeTarget
                 FarmController.clearTarget()
                 FarmController.acquireTarget(true, State.lastCycleSkip)
-                acquiredNewTarget = State.activeTarget ~= nil
+                acquiredNewTarget = State.activeTarget ~= nil or State.activeTargetLockCF ~= nil
             end
         end
 
-        if not State.activeTarget then
+        local targetCF = FarmController.refreshTargetLock(acquiredNewTarget)
+
+        if not targetCF and State.activeTargetLockCF then
+            targetCF = State.activeTargetLockCF
+        end
+
+        if not targetCF then
             MovementController.syncHoldState()
-            return 0
+            return INTERNAL.TARGET_LOST_TICK
         end
 
         if Config.AutoEquip then
             EquipController.equipSelected(false)
         end
 
-        local targetCF = FarmController.refreshTargetLock(false)
-        if not targetCF then
-            FarmController.clearTarget()
-            MovementController.setHoldState(false)
-            MovementController.syncHoldState()
-            return 0
-        end
-
         if acquiredNewTarget then
             MovementController.setHoldState(false)
-            targetCF = FarmController.refreshTargetLock(true) or targetCF
             MovementController.safePivotTo(targetCF, true)
+        else
+            MovementController.moveToward(targetCF)
         end
 
         if MovementController.shouldUseHold() then
@@ -1923,29 +2036,32 @@ function FarmController.step()
             MovementController.setHoldState(false)
         end
 
-        MovementController.moveToward(targetCF)
-
         CombatController.tryActivateTool()
 
-        if State.holdEnabled and State.activeTargetLockCF then
-            MovementController.updateHoldTarget(State.activeTargetLockCF)
+        if State.holdEnabled then
+            MovementController.updateHoldTarget(targetCF)
         end
 
         if State.activeTarget and not NPCController.isAlive(State.activeTarget) then
-            -- Kill confirmed: clear and immediately attempt to acquire and move to next target.
             FarmController.clearTarget()
             MovementController.setHoldState(false)
             MovementController.syncHoldState()
+
+            local delayAfterKill = math.max(0, tonumber(Config.Delay) or 0)
+            if delayAfterKill > 0 then
+                State.lastKillAt = os.clock()
+                return delayAfterKill
+            end
+
             if attempt < 2 then
                 continue
             end
-            return 0
         end
 
-        return 0
+        return FarmController.getStepDelay(true)
     end
 
-    return 0
+    return INTERNAL.TARGET_LOST_TICK
 end
 
 function UIController.refreshNPCDropdowns(force)
@@ -2233,9 +2349,9 @@ function UIController.create()
 
     farmMainSection:Slider({
         Title = "Teleport Delay",
-        Desc = "Float supported",
-        Step = 0.01,
-        Value = { Min = 0, Max = 0.5, Default = Config.TPDelay },
+        Desc = "Real delay between repositions",
+        Step = 0.005,
+        Value = { Min = 0, Max = 0.25, Default = Config.TPDelay },
         Flag = "tp_delay",
         Callback = function(value)
             Config.TPDelay = value
@@ -2244,8 +2360,9 @@ function UIController.create()
 
     farmMainSection:Slider({
         Title = "Post Kill Delay",
-        Step = 0.05,
-        Value = { Min = 0, Max = 5, Default = Config.Delay },
+        Desc = "Agora aplica de verdade",
+        Step = 0.01,
+        Value = { Min = 0, Max = 1, Default = Config.Delay },
         Flag = "post_kill_delay",
         Callback = function(value)
             Config.Delay = value
@@ -2356,6 +2473,56 @@ function UIController.create()
         end,
     })
 
+    combatSection:Toggle({
+        Title = "Pack Center TP",
+        Desc = "Mira no centro do pack em vez de um NPC isolado",
+        Value = Config.PreferPackCenter,
+        Flag = "pack_center_tp",
+        Callback = function(state)
+            Config.PreferPackCenter = state
+        end,
+    })
+
+    combatSection:Toggle({
+        Title = "Orbit Pack",
+        Desc = "Fica rodando no pack pra skill pegar todos",
+        Value = Config.PackOrbit,
+        Flag = "pack_orbit",
+        Callback = function(state)
+            Config.PackOrbit = state
+        end,
+    })
+
+    combatSection:Slider({
+        Title = "Orbit Radius",
+        Step = 0.25,
+        Value = { Min = 1.5, Max = 12, Default = Config.OrbitRadius },
+        Flag = "orbit_radius",
+        Callback = function(value)
+            Config.OrbitRadius = value
+        end,
+    })
+
+    combatSection:Slider({
+        Title = "Orbit Speed",
+        Step = 0.1,
+        Value = { Min = 0.2, Max = 6, Default = Config.OrbitSpeed },
+        Flag = "orbit_speed",
+        Callback = function(value)
+            Config.OrbitSpeed = value
+        end,
+    })
+
+    combatSection:Slider({
+        Title = "Extra Orbit Height",
+        Step = 0.25,
+        Value = { Min = -3, Max = 6, Default = Config.OrbitHeight },
+        Flag = "orbit_height",
+        Callback = function(value)
+            Config.OrbitHeight = value
+        end,
+    })
+
     local weaponSection = CombatTab:Section({
         Title = "Auto Equip Weapon",
         Box = true,
@@ -2402,8 +2569,8 @@ function UIController.create()
     weaponSection:Slider({
         Title = "Attack Delay",
         Desc = "How fast to activate the tool",
-        Step = 0.01,
-        Value = { Min = 0, Max = 0.6, Default = Config.AttackDelay },
+        Step = 0.005,
+        Value = { Min = 0, Max = 0.3, Default = Config.AttackDelay },
         Flag = "attack_delay",
         Callback = function(value)
             Config.AttackDelay = value
@@ -2413,7 +2580,7 @@ function UIController.create()
     weaponSection:Toggle({
         Title = "Cycle Targets",
         Desc = "Switch NPC target every X seconds (even if not dead)",
-        Value = true,
+        Value = Config.CycleTargets,
         Flag = "cycle_targets",
         Callback = function(state)
             Config.CycleTargets = state
