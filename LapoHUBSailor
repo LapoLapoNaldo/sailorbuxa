@@ -554,6 +554,35 @@ function NPCController.getDistanceFromCharacter(model)
     return (hrp.Position - root.Position).Magnitude
 end
 
+function NPCController.findNearestValidAny()
+    local best = nil
+    local bestDist = math.huge
+
+    for _, npc in ipairs(NPCController.getValidNPCs(true)) do
+        local d = NPCController.getDistanceFromCharacter(npc)
+        if d < bestDist then
+            bestDist = d
+            best = npc
+        end
+    end
+
+    if best then
+        return best, bestDist
+    end
+
+    for _, npc in ipairs(NPCController.getListableNPCs()) do
+        if NPCController.isValid(npc) then
+            local d = NPCController.getDistanceFromCharacter(npc)
+            if d < bestDist then
+                bestDist = d
+                best = npc
+            end
+        end
+    end
+
+    return best, bestDist
+end
+
 function EquipController.getEquippedTool()
     if not refreshCharacterRefs() or not char then
         return nil
@@ -1032,7 +1061,12 @@ function MovementController.safePivotTo(targetCF, force)
             local stepPosition = currentPosition:Lerp(finalPosition, alpha)
             local stepCF = CFrame.new(stepPosition, finalPosition)
 
-            char:PivotTo(stepCF)
+            pcall(function()
+                hrp.CFrame = stepCF
+            end)
+            pcall(function()
+                char:PivotTo(stepCF)
+            end)
             MovementController.zeroVelocity()
 
             if State.holdEnabled then
@@ -1043,7 +1077,12 @@ function MovementController.safePivotTo(targetCF, force)
         end
     end
 
-    char:PivotTo(targetCF)
+    pcall(function()
+        hrp.CFrame = targetCF
+    end)
+    pcall(function()
+        char:PivotTo(targetCF)
+    end)
     MovementController.zeroVelocity()
 
     State.lastTeleportAt = os.clock()
@@ -1769,6 +1808,36 @@ function UIController.create()
                         ok and tostring(State.LastEquipped) or ("Could not equip " .. tostring(Config.EquipLabel)),
                         ok and "check" or "x",
                         3
+                    )
+                end,
+            },
+            {
+                Title = "TP nearest NPC (debug)",
+                Icon = "crosshair",
+                Callback = function()
+                    local npc, dist = NPCController.findNearestValidAny()
+                    if not npc then
+                        notify("TP Debug", "No valid NPC found in workspace.", "x", 4)
+                        return
+                    end
+
+                    local cf = MovementController.getTargetCFrameForNPC(npc)
+                    if not cf then
+                        notify("TP Debug", "Nearest NPC has no valid CFrame: " .. tostring(npc.Name), "x", 4)
+                        return
+                    end
+
+                    MovementController.setHoldState(false)
+                    local moved = MovementController.safePivotTo(cf, true)
+                    notify(
+                        "TP Debug",
+                        (moved and "Teleported to " or "Teleport skipped to ")
+                            .. tostring(npc.Name)
+                            .. " (dist "
+                            .. string.format("%.1f", tonumber(dist) or 0)
+                            .. ")",
+                        moved and "check" or "triangle-alert",
+                        4
                     )
                 end,
             },
