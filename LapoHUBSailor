@@ -24,6 +24,10 @@ local LocalPlayer = Players.LocalPlayer
 local Config = {
     FarmMobs = false,
     FarmBosses = false,
+    FarmTimedBosses = false,
+    FarmAllMobsTimedBosses = false,
+
+    InfiniteRangeTP = true,
     Delay = 0.05,
     SelectedTarget = "Any",
 
@@ -51,14 +55,40 @@ local State = {
 
     Target = nil,
     TargetName = "None",
-
     LastEquip = 0,
+
     Hidden = {},
+    Connections = {},
 
     Window = nil,
-    TargetDropdown = nil,
+    TargetDropdown = nil
+}
 
-    Connections = {}
+local TIMED_BOSS_NAMES = {
+    "AizenBoss",
+    "AlucardBoss",
+    "GojoBoss",
+    "JinwooBoss",
+    "StrongestShinobiBoss",
+    "SukunaBoss",
+    "Yamato",
+    "YujiBoss"
+}
+
+local TIMED_BOSS_LOOKUP = {}
+for _, name in ipairs(TIMED_BOSS_NAMES) do
+    TIMED_BOSS_LOOKUP[name] = true
+end
+
+local IgnoreKeywords = {
+    "shop", "seller", "merchant", "store", "buy", "dealer",
+    "quest", "mission", "dialog", "dialogue", "talk", "teleport",
+    "trainer", "teacher", "upgrade", "smith", "craft", "summon",
+    "safe zone", "safezone", "inventory", "spin", "gacha"
+}
+
+local BossKeywords = {
+    "boss", "raidboss", "worldboss"
 }
 
 local SlotMap = {
@@ -73,10 +103,16 @@ local function getCharacter()
     State.Root = State.Character and State.Character:FindFirstChild("HumanoidRootPart") or nil
 end
 
+local function getHumanoid(model)
+    return model and model:FindFirstChildOfClass("Humanoid") or nil
+end
+
 local function getModelRoot(model)
-    return model:FindFirstChild("HumanoidRootPart")
+    return model and (
+        model:FindFirstChild("HumanoidRootPart")
         or model.PrimaryPart
         or model:FindFirstChildWhichIsA("BasePart")
+    ) or nil
 end
 
 local function cleanName(name)
@@ -86,7 +122,83 @@ local function cleanName(name)
     return s ~= "" and s or tostring(name)
 end
 
-local function isAliveNPC(model)
+local function normalizeName(name)
+    local s = tostring(name or ""):lower()
+    s = s:gsub("%d+$", "")
+    s = s:gsub("[%[%]%(%)%{%}]", "")
+    s = s:gsub("[_%-%s]+", "")
+    return s
+end
+
+local function deriveSpawnKey(name)
+    local s = normalizeName(name)
+    s = s:gsub("spawnpoint", "")
+    s = s:gsub("spawner", "")
+    s = s:gsub("spawn", "")
+    s = s:gsub("npc", "")
+    s = s:gsub("mob", "")
+    s = s:gsub("boss", "")
+    return s
+end
+
+local function hasKeyword(text, keywords)
+    text = string.lower(tostring(text or ""))
+
+    for _, word in ipairs(keywords) do
+        if text:find(word, 1, true) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function getPivotCFrame(obj)
+    if not obj then
+        return nil
+    end
+
+    if obj:IsA("BasePart") then
+        return obj.CFrame
+    end
+
+    if obj:IsA("Model") then
+        local root = getModelRoot(obj)
+        if root then
+            return root.CFrame
+        end
+
+        local ok, cf = pcall(function()
+            return obj:GetPivot()
+        end)
+
+        if ok then
+            return cf
+        end
+    end
+
+    return nil
+end
+
+local function getNPCFolder()
+    if Config.NPCFolderName then
+        local folder = Workspace:FindFirstChild(Config.NPCFolderName)
+        if folder then
+            return folder
+        end
+    end
+
+    for _, name in ipairs({ "NPCs", "Enemies", "Mobs" }) do
+        local folder = Workspace:FindFirstChild(name)
+        if folder then
+            return folder
+        end
+    end
+
+    return nil
+end
+
+local function isAliveHumanoidModel(model)
     if not model or not model:IsA("Model") or not model.Parent then
         return false
     end
@@ -99,62 +211,119 @@ local function isAliveNPC(model)
         return false
     end
 
-    if string.find(model.Name, "TrainingDummy") then
+    if tostring(model.Name):find("TrainingDummy") then
         return false
     end
 
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then
+    local hum = getHumanoid(model)
+    local root = getModelRoot(model)
+
+    if not hum or hum.Health <= 0 or not root then
         return false
     end
 
-    return getModelRoot(model) ~= nil
+    return true
 end
 
-local function getNPCFolder()
-    if Config.NPCFolderName then
-        local folder = Workspace:FindFirstChild(Config.NPCFolderName)
-        if folder then
-            return folder
+local function isServiceNPC(model)
+    if not isAliveHumanoidModel(model) then
+        return false
+    end
+
+    local hum = getHumanoid(model)
+    local root = getModelRoot(model)
+
+    if hasKeyword(model.Name, IgnoreKeywords) then
+        return true
+    end
+
+    if hum and hasKeyword(hum.DisplayName, IgnoreKeywords) then
+        return true
+    end
+
+    local hasInteraction = false
+
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") or d:IsA("Dialog") then
+            hasInteraction = true
+        end
+
+        if hasKeyword(d.Name, IgnoreKeywords) then
+            return true
+        end
+
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            if hasKeyword(d.Text, IgnoreKeywords) then
+                return true
+            end
         end
     end
-    return nil
+
+    if hasInteraction and root and root.Anchored then
+        return true
+    end
+
+    return false
+end
+
+local function isCombatNPC(model)
+    return isAliveHumanoidModel(model) and not isServiceNPC(model)
+end
+
+local function isTimedBoss(model)
+    return model and TIMED_BOSS_LOOKUP[model.Name] == true or false
 end
 
 local function isBoss(model)
-    if not model then
+    if not isCombatNPC(model) then
         return false
     end
 
-    local name = string.lower(model.Name)
-    return model:GetAttribute("Boss") == true
-        or model:GetAttribute("IsBoss") == true
-        or name:find("boss", 1, true) ~= nil
+    local hum = getHumanoid(model)
+
+    if model:GetAttribute("Boss") == true or model:GetAttribute("IsBoss") == true then
+        return true
+    end
+
+    if isTimedBoss(model) then
+        return true
+    end
+
+    if hasKeyword(model.Name, BossKeywords) then
+        return true
+    end
+
+    if hum and hasKeyword(hum.DisplayName, BossKeywords) then
+        return true
+    end
+
+    return false
 end
 
-local function scanNPCs()
+local function scanCombatNPCs()
     local list = {}
-    local folder = getNPCFolder()
     local seen = {}
+    local folder = getNPCFolder()
+
+    local function addModel(inst)
+        if inst:IsA("Model") and isCombatNPC(inst) and not seen[inst] then
+            local parentModel = inst.Parent
+            if parentModel and parentModel:IsA("Model") and getHumanoid(parentModel) then
+                return
+            end
+
+            seen[inst] = true
+            table.insert(list, inst)
+        end
+    end
 
     if folder then
         for _, inst in ipairs(folder:GetDescendants()) do
-            if inst:IsA("Model") and isAliveNPC(inst) then
-                local parentModel = inst.Parent
-                if parentModel and parentModel:IsA("Model") and parentModel:FindFirstChildOfClass("Humanoid") then
-                    continue
-                end
-                if not seen[inst] then
-                    seen[inst] = true
-                    table.insert(list, inst)
-                end
-            end
+            addModel(inst)
         end
     else
         for _, inst in ipairs(Workspace:GetDescendants()) do
-            if inst:IsA("Model") and isAliveNPC(inst) then
-                table.insert(list, inst)
-            end
+            addModel(inst)
         end
     end
 
@@ -162,23 +331,34 @@ local function scanNPCs()
 end
 
 local function isAllowedTarget(model)
-    if not isAliveNPC(model) then
+    if not isCombatNPC(model) then
         return false
     end
 
     local boss = isBoss(model)
+    local timed = isTimedBoss(model)
 
-    if boss and not Config.FarmBosses then
+    if Config.FarmTimedBosses and not timed then
         return false
     end
 
-    if not boss and not Config.FarmMobs then
-        return false
+    if Config.FarmAllMobsTimedBosses then
+        if boss and not timed then
+            return false
+        end
+    else
+        if boss and not Config.FarmBosses and not Config.FarmTimedBosses then
+            return false
+        end
+
+        if not boss and not Config.FarmMobs then
+            return false
+        end
     end
 
     if Config.SelectedTarget ~= "Any" then
-        local name = cleanName(model.Name)
-        if name ~= Config.SelectedTarget and model.Name ~= Config.SelectedTarget then
+        local base = cleanName(model.Name)
+        if base ~= Config.SelectedTarget and model.Name ~= Config.SelectedTarget then
             return false
         end
     end
@@ -186,27 +366,94 @@ local function isAllowedTarget(model)
     return true
 end
 
-local function acquireTarget()
+local function findModelCFrameByName(baseName)
+    local wanted = normalizeName(baseName)
+    local bestCF, bestDist = nil, math.huge
+
     if not State.Root then
         return nil
     end
 
-    local best, bestDist = nil, math.huge
-
-    for _, npc in ipairs(scanNPCs()) do
-        if isAllowedTarget(npc) then
-            local root = getModelRoot(npc)
-            if root then
-                local dist = (State.Root.Position - root.Position).Magnitude
-                if dist < bestDist then
-                    bestDist = dist
-                    best = npc
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("Model") and inst ~= State.Character and not Players:GetPlayerFromCharacter(inst) then
+            if normalizeName(cleanName(inst.Name)) == wanted or normalizeName(inst.Name) == wanted then
+                local cf = getPivotCFrame(inst)
+                if cf then
+                    local dist = (State.Root.Position - cf.Position).Magnitude
+                    if dist < bestDist then
+                        bestDist = dist
+                        bestCF = cf
+                    end
                 end
             end
         end
     end
 
-    return best
+    return bestCF
+end
+
+local function findSpawnCFrameByName(baseName)
+    local wanted = deriveSpawnKey(baseName)
+    local bestCF, bestDist = nil, math.huge
+
+    if wanted == "" or not State.Root then
+        return nil
+    end
+
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        local lower = tostring(inst.Name):lower()
+        if lower:find("spawn", 1, true) or lower:find("spawner", 1, true) then
+            local key = deriveSpawnKey(inst.Name)
+            if key ~= "" and key == wanted then
+                local cf = getPivotCFrame(inst)
+                if cf then
+                    local dist = (State.Root.Position - cf.Position).Magnitude
+                    if dist < bestDist then
+                        bestDist = dist
+                        bestCF = cf
+                    end
+                end
+            end
+        end
+    end
+
+    return bestCF
+end
+
+local function getInfiniteRangeCFrame(name)
+    return findModelCFrameByName(name) or findSpawnCFrameByName(name)
+end
+
+local function acquireTarget()
+    if not State.Root then
+        return nil
+    end
+
+    local timedBest, timedDist = nil, math.huge
+    local best, bestDist = nil, math.huge
+
+    for _, npc in ipairs(scanCombatNPCs()) do
+        if isAllowedTarget(npc) then
+            local root = getModelRoot(npc)
+            if root then
+                local dist = (State.Root.Position - root.Position).Magnitude
+
+                if isTimedBoss(npc) then
+                    if dist < timedDist then
+                        timedDist = dist
+                        timedBest = npc
+                    end
+                else
+                    if dist < bestDist then
+                        bestDist = dist
+                        best = npc
+                    end
+                end
+            end
+        end
+    end
+
+    return timedBest or best
 end
 
 local function resolveTarget()
@@ -229,15 +476,65 @@ local function getTargetCFrame(npc)
     return CFrame.new(pos, root.Position)
 end
 
-local function teleportToTarget(npc)
-    if not State.Root then
-        return
-    end
-
-    local cf = getTargetCFrame(npc)
-    if cf then
+local function teleportToCFrame(cf)
+    if State.Root and cf then
         State.Root.CFrame = cf
     end
+end
+
+local function teleportToTarget(npc)
+    local cf = getTargetCFrame(npc)
+    if cf then
+        teleportToCFrame(cf)
+    end
+end
+
+local function tryInfiniteRangeTeleport()
+    if not Config.InfiniteRangeTP or not State.Root then
+        return false
+    end
+
+    local candidates = {}
+
+    if Config.FarmTimedBosses then
+        for _, name in ipairs(TIMED_BOSS_NAMES) do
+            if Config.SelectedTarget == "Any" or Config.SelectedTarget == name or Config.SelectedTarget == cleanName(name) then
+                table.insert(candidates, name)
+            end
+        end
+    elseif Config.FarmAllMobsTimedBosses then
+        if Config.SelectedTarget ~= "Any" then
+            table.insert(candidates, Config.SelectedTarget)
+        end
+
+        for _, name in ipairs(TIMED_BOSS_NAMES) do
+            table.insert(candidates, name)
+        end
+    else
+        if Config.SelectedTarget ~= "Any" then
+            table.insert(candidates, Config.SelectedTarget)
+        end
+    end
+
+    local bestCF, bestDist = nil, math.huge
+
+    for _, name in ipairs(candidates) do
+        local cf = getInfiniteRangeCFrame(name)
+        if cf then
+            local dist = (State.Root.Position - cf.Position).Magnitude
+            if dist < bestDist then
+                bestDist = dist
+                bestCF = cf
+            end
+        end
+    end
+
+    if bestCF then
+        teleportToCFrame(bestCF)
+        return true
+    end
+
+    return false
 end
 
 local function getEquippedTool()
@@ -260,7 +557,6 @@ local function tapEquipSlot()
     end
 
     State.LastEquip = now
-
     VirtualInputManager:SendKeyEvent(true, key, false, game)
     task.wait()
     VirtualInputManager:SendKeyEvent(false, key, false, game)
@@ -368,8 +664,7 @@ local function isProtectedWorkspaceRoot(root)
         return true
     end
 
-    local humanoid = root:FindFirstChildWhichIsA("Humanoid", true)
-    if humanoid then
+    if root:IsA("Model") and getHumanoid(root) then
         return true
     end
 
@@ -427,14 +722,14 @@ local function applyFPSBoost()
 end
 
 local function getTargetOptions()
-    local seen = { Any = true }
+    local seen = { ["Any"] = true }
     local values = { "Any" }
 
-    for _, npc in ipairs(scanNPCs()) do
-        local name = cleanName(npc.Name)
-        if not seen[name] then
-            seen[name] = true
-            table.insert(values, name)
+    for _, npc in ipairs(scanCombatNPCs()) do
+        local base = cleanName(npc.Name)
+        if not seen[base] then
+            seen[base] = true
+            table.insert(values, base)
         end
     end
 
@@ -486,7 +781,7 @@ local Window = WindUI:CreateWindow({
     Icon = "swords",
     Author = "WaveAI",
     Folder = "LapoHubSailorPiece",
-    Size = UDim2.fromOffset(600, 420),
+    Size = UDim2.fromOffset(620, 430),
     MinSize = Vector2.new(560, 400),
     MaxSize = Vector2.new(900, 700),
     ToggleKey = Enum.KeyCode.RightShift,
@@ -514,10 +809,11 @@ FarmSection:Toggle({
     Value = Config.FarmMobs,
     Callback = function(v)
         Config.FarmMobs = v
-        if not v and not Config.FarmBosses then
-            State.Target = nil
-            State.TargetName = "None"
+        if v then
+            Config.FarmTimedBosses = false
+            Config.FarmAllMobsTimedBosses = false
         end
+        State.Target = nil
     end
 })
 
@@ -526,10 +822,47 @@ FarmSection:Toggle({
     Value = Config.FarmBosses,
     Callback = function(v)
         Config.FarmBosses = v
-        if not v and not Config.FarmMobs then
-            State.Target = nil
-            State.TargetName = "None"
+        if v then
+            Config.FarmTimedBosses = false
+            Config.FarmAllMobsTimedBosses = false
         end
+        State.Target = nil
+    end
+})
+
+FarmSection:Toggle({
+    Title = "Only Timed Bosses",
+    Value = Config.FarmTimedBosses,
+    Callback = function(v)
+        Config.FarmTimedBosses = v
+        if v then
+            Config.FarmMobs = false
+            Config.FarmBosses = false
+            Config.FarmAllMobsTimedBosses = false
+        end
+        State.Target = nil
+    end
+})
+
+FarmSection:Toggle({
+    Title = "Farm All Mobs + Timed Bosses",
+    Value = Config.FarmAllMobsTimedBosses,
+    Callback = function(v)
+        Config.FarmAllMobsTimedBosses = v
+        if v then
+            Config.FarmMobs = false
+            Config.FarmBosses = false
+            Config.FarmTimedBosses = false
+        end
+        State.Target = nil
+    end
+})
+
+FarmSection:Toggle({
+    Title = "Infinite Range TP",
+    Value = Config.InfiniteRangeTP,
+    Callback = function(v)
+        Config.InfiniteRangeTP = v
     end
 })
 
@@ -688,7 +1021,12 @@ task.spawn(function()
             resetCharacter(LocalPlayer.Character)
             task.wait(0.25)
         else
-            local farming = Config.FarmMobs or Config.FarmBosses
+            local farming =
+                Config.FarmMobs
+                or Config.FarmBosses
+                or Config.FarmTimedBosses
+                or Config.FarmAllMobsTimedBosses
+
             local target = farming and resolveTarget() or nil
 
             if target then
@@ -705,6 +1043,10 @@ task.spawn(function()
             else
                 State.Target = nil
                 State.TargetName = "None"
+
+                if farming then
+                    tryInfiniteRangeTeleport()
+                end
 
                 if Config.AirHold and State.Root then
                     holdInAir(State.Root.CFrame)
