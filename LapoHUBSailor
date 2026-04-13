@@ -83,6 +83,8 @@ local Config = {
     BypassTP = true,
     AutoAttack = true,
     AttackDelay = 0.12,
+    CycleTargets = true,
+    CycleInterval = 2.5,
 
     SelectedEnemies = {},
     SelectedBosses = {},
@@ -120,6 +122,8 @@ local State = {
     lastTeleportAt = 0,
     lastEquipAt = 0,
     lastAttackAt = 0,
+    lastCycleAt = 0,
+    lastCycleSkip = nil,
 
     holdEnabled = false,
     holdTargetCF = nil,
@@ -1468,22 +1472,28 @@ function FarmController.getTargetKind(npc)
 end
 
 function FarmController.pickClosest(candidates)
+    return FarmController.pickClosestExcluding(candidates, nil)
+end
+
+function FarmController.pickClosestExcluding(candidates, exclude)
     local bestNPC = nil
     local bestDistance = math.huge
 
     for _, npc in ipairs(candidates) do
+        if npc ~= exclude then
         local distance = NPCController.getDistanceFromCharacter(npc)
 
         if distance < bestDistance then
             bestDistance = distance
             bestNPC = npc
         end
+        end
     end
 
     return bestNPC
 end
 
-function FarmController.acquireTarget(forceRefresh)
+function FarmController.acquireTarget(forceRefresh, exclude)
     NPCController.refreshCache(forceRefresh)
 
     local timedCandidates = {}
@@ -1510,16 +1520,20 @@ function FarmController.acquireTarget(forceRefresh)
     local nextTarget = nil
 
     if #timedCandidates > 0 then
-        nextTarget = FarmController.pickClosest(timedCandidates)
+        nextTarget = FarmController.pickClosestExcluding(timedCandidates, exclude)
     elseif #regularCandidates > 0 then
-        nextTarget = FarmController.pickClosest(regularCandidates)
+        nextTarget = FarmController.pickClosestExcluding(regularCandidates, exclude)
     else
         for _, npc in ipairs(NPCController.getListableNPCs()) do
-            if FarmController.isCandidateAllowed(npc) and MovementController.getTargetCFrameForNPC(npc) then
+            if npc ~= exclude and FarmController.isCandidateAllowed(npc) and MovementController.getTargetCFrameForNPC(npc) then
                 nextTarget = npc
                 break
             end
         end
+    end
+
+    if not nextTarget and exclude ~= nil then
+        return FarmController.acquireTarget(forceRefresh, nil)
     end
 
     if nextTarget then
@@ -1589,7 +1603,7 @@ function FarmController.step()
     end
 
     if not State.activeTarget then
-        FarmController.acquireTarget(true)
+        FarmController.acquireTarget(true, State.lastCycleSkip)
         acquiredNewTarget = State.activeTarget ~= nil
     elseif (os.clock() - State.lastTargetRefreshAt) >= INTERNAL.NPC_CACHE_TTL then
         NPCController.refreshCache(true)
@@ -1597,7 +1611,19 @@ function FarmController.step()
 
         if not FarmController.shouldKeepTarget(State.activeTarget) then
             FarmController.clearTarget()
-            FarmController.acquireTarget(false)
+            FarmController.acquireTarget(false, State.lastCycleSkip)
+            acquiredNewTarget = State.activeTarget ~= nil
+        end
+    end
+
+    if State.activeTarget and Config.CycleTargets then
+        local now = os.clock()
+        local interval = math.clamp(tonumber(Config.CycleInterval) or 2.5, 0.35, 30)
+        if (now - (State.lastCycleAt or 0)) >= interval then
+            State.lastCycleAt = now
+            State.lastCycleSkip = State.activeTarget
+            FarmController.clearTarget()
+            FarmController.acquireTarget(true, State.lastCycleSkip)
             acquiredNewTarget = State.activeTarget ~= nil
         end
     end
@@ -2106,6 +2132,29 @@ function UIController.create()
         Flag = "attack_delay",
         Callback = function(value)
             Config.AttackDelay = value
+        end,
+    })
+
+    weaponSection:Toggle({
+        Title = "Cycle Targets",
+        Desc = "Switch NPC target every X seconds (even if not dead)",
+        Value = true,
+        Flag = "cycle_targets",
+        Callback = function(state)
+            Config.CycleTargets = state
+            State.lastCycleAt = 0
+            State.lastCycleSkip = nil
+        end,
+    })
+
+    weaponSection:Slider({
+        Title = "Cycle Interval",
+        Desc = "Seconds before switching target",
+        Step = 0.1,
+        Value = { Min = 0.35, Max = 30, Default = Config.CycleInterval },
+        Flag = "cycle_interval",
+        Callback = function(value)
+            Config.CycleInterval = value
         end,
     })
 
