@@ -82,6 +82,7 @@ local Config = {
     Delay = 0.45,
     TPDelay = 0.05,
     BypassTP = true,
+    InfiniteRangeTP = true,
     AutoAttack = true,
     AttackDelay = 0.12,
     CycleTargets = true,
@@ -1640,6 +1641,58 @@ function FarmController.acquireTarget(forceRefresh, exclude)
 
     local timedCandidates = {}
     local regularCandidates = {}
+
+    -- Infinite range: prefer teleporting to the map's spawn/model position for selected targets,
+    -- even if some NPCs are currently nearby/replicated.
+    if Config.InfiniteRangeTP then
+        local bestCF = nil
+        local bestName = nil
+        local bestDist = math.huge
+
+        local function considerSelectionForCF(map)
+            for name, enabled in pairs(map) do
+                if enabled then
+                    local cf = NPCController.findModelCFrameForBaseName(name) or NPCController.findSpawnCFrameForBaseName(name)
+                    if cf and refreshCharacterRefs() and hrp then
+                        local d = (hrp.Position - cf.Position).Magnitude
+                        if d < bestDist then
+                            bestDist = d
+                            bestCF = cf
+                            bestName = name
+                        end
+                    end
+                end
+            end
+        end
+
+        if State.farmMode == "mobs" then
+            considerSelectionForCF(Config.SelectedEnemies)
+        elseif State.farmMode == "bosses" then
+            considerSelectionForCF(Config.SelectedBosses)
+        elseif State.farmMode == "all" then
+            considerSelectionForCF(Config.SelectedEnemies)
+            considerSelectionForCF(Config.SelectedBosses)
+        elseif State.farmMode == "timed" then
+            for _, timedName in ipairs(TIMED_BOSS_NAMES) do
+                local cf = NPCController.findModelCFrameForBaseName(timedName) or NPCController.findSpawnCFrameForBaseName(timedName)
+                if cf and refreshCharacterRefs() and hrp then
+                    local d = (hrp.Position - cf.Position).Magnitude
+                    if d < bestDist then
+                        bestDist = d
+                        bestCF = cf
+                        bestName = timedName
+                    end
+                end
+            end
+        end
+
+        if bestCF and bestName then
+            FarmController.clearTarget()
+            FarmController.setSpawnTarget(bestName, bestCF, "Spawn")
+            State.lastTargetRefreshAt = os.clock()
+            return nil
+        end
+    end
 
     if State.farmMode == "timed" then
         for _, npc in ipairs(NPCController.getTimedBosses(false)) do
