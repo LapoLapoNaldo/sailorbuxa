@@ -417,6 +417,53 @@ function NPCController.findSpawnCFrameForBaseName(baseName)
     return State.spawnCache.byKey[key]
 end
 
+function NPCController.findModelCFrameForBaseName(baseName)
+    local key = NPCController.normalizeKey(baseName)
+    if key == "" then
+        return nil
+    end
+
+    if not refreshCharacterRefs() or not hrp then
+        return nil
+    end
+
+    local bestCF = nil
+    local bestDist = math.huge
+
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("Model")
+            and not NPCController.isTrainingDummy(obj)
+            and (not char or not obj:IsDescendantOf(char))
+            and not Players:GetPlayerFromCharacter(obj)
+        then
+            if NPCController.normalizeKey(obj.Name) == key then
+                local cf = nil
+                local root = NPCController.getRoot(obj)
+                if root then
+                    cf = root.CFrame
+                else
+                    local ok, pivot = pcall(function()
+                        return obj:GetPivot()
+                    end)
+                    if ok and pivot then
+                        cf = pivot
+                    end
+                end
+
+                if cf then
+                    local d = (hrp.Position - cf.Position).Magnitude
+                    if d < bestDist then
+                        bestDist = d
+                        bestCF = cf
+                    end
+                end
+            end
+        end
+    end
+
+    return bestCF
+end
+
 function NPCController.isBossName(name)
     return tostring(name or ""):match("Boss$") ~= nil or TIMED_BOSS_LOOKUP[tostring(name or "")] == true
 end
@@ -1650,7 +1697,7 @@ function FarmController.acquireTarget(forceRefresh, exclude)
         local function considerSelection(map)
             for name, enabled in pairs(map) do
                 if enabled then
-                    local cf = NPCController.findSpawnCFrameForBaseName(name)
+                    local cf = NPCController.findSpawnCFrameForBaseName(name) or NPCController.findModelCFrameForBaseName(name)
                     if cf and refreshCharacterRefs() and hrp then
                         local d = (hrp.Position - cf.Position).Magnitude
                         if d < bestDist then
@@ -1673,7 +1720,7 @@ function FarmController.acquireTarget(forceRefresh, exclude)
         elseif State.farmMode == "timed" then
             -- timed bosses are hardcoded names; try those as spawn keys
             for _, timedName in ipairs(TIMED_BOSS_NAMES) do
-                local cf = NPCController.findSpawnCFrameForBaseName(timedName)
+                local cf = NPCController.findSpawnCFrameForBaseName(timedName) or NPCController.findModelCFrameForBaseName(timedName)
                 if cf and refreshCharacterRefs() and hrp then
                     local d = (hrp.Position - cf.Position).Magnitude
                     if d < bestDist then
