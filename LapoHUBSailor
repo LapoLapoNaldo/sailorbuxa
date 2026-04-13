@@ -983,6 +983,20 @@ function MovementController.safePivotTo(targetCF, force)
         return false
     end
 
+    if hum then
+        hum.Sit = false
+        hum.PlatformStand = false
+        pcall(function()
+            hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics)
+        end)
+    end
+
+    if hrp.Anchored then
+        pcall(function()
+            hrp.Anchored = false
+        end)
+    end
+
     local distance = (hrp.Position - targetCF.Position).Magnitude
 
     if distance <= INTERNAL.MIN_POSITION_EPSILON and not force then
@@ -1368,25 +1382,27 @@ function FarmController.isCandidateAllowed(npc)
     local baseName = NPCController.getBaseName(npc.Name)
     local isBoss = NPCController.isBossName(npc.Name)
     local isTimedBoss = TIMED_BOSS_LOOKUP[npc.Name] == true
+    local selectedMobsCount = countEnabled(Config.SelectedEnemies)
+    local selectedBossCount = countEnabled(Config.SelectedBosses)
 
     if State.farmMode == "timed" then
         return isTimedBoss
     end
 
     if State.farmMode == "mobs" then
-        return not isBoss and Config.SelectedEnemies[baseName] == true
+        return not isBoss and (selectedMobsCount == 0 or Config.SelectedEnemies[baseName] == true)
     end
 
     if State.farmMode == "bosses" then
-        return isBoss and Config.SelectedBosses[baseName] == true
+        return isBoss and (selectedBossCount == 0 or Config.SelectedBosses[baseName] == true)
     end
 
     if State.farmMode == "all" then
         if isBoss then
-            return Config.SelectedBosses[baseName] == true
+            return selectedBossCount == 0 or Config.SelectedBosses[baseName] == true
         end
 
-        return Config.SelectedEnemies[baseName] == true
+        return selectedMobsCount == 0 or Config.SelectedEnemies[baseName] == true
     end
 
     return false
