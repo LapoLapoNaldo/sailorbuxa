@@ -75,6 +75,7 @@ local INTERNAL = {
     HOLD_POSITION_D = 1450,
     HOLD_GYRO_P = 100000,
     HOLD_GYRO_D = 1250,
+    SPAWN_CACHE_TTL = 8.0,
 }
 
 local Config = {
@@ -141,6 +142,11 @@ local State = {
     npcCache = {
         models = {},
         timed = {},
+        indexedAt = 0,
+    },
+
+    spawnCache = {
+        byKey = {},
         indexedAt = 0,
     },
 
@@ -329,6 +335,86 @@ end
 
 function NPCController.getBaseName(name)
     return (tostring(name or ""):gsub("%d+$", ""))
+end
+
+function NPCController.normalizeKey(name)
+    local s = tostring(name or ""):lower()
+    s = s:gsub("%d+$", "")
+    s = s:gsub("[_%-%s]+", "")
+    return s
+end
+
+function NPCController.deriveSpawnKey(rawName)
+    local s = tostring(rawName or "")
+    if s == "" then
+        return nil
+    end
+
+    s = s:gsub("%d+$", "")
+    s = s:gsub("[%[%]%(%)%{%}]", "")
+    s = s:gsub("[_%-%s]+", "")
+    s = s:gsub("(?i)spawnpoint", "")
+    s = s:gsub("(?i)spawner", "")
+    s = s:gsub("(?i)spawn", "")
+    s = s:gsub("(?i)npc", "")
+    s = s:gsub("(?i)mob", "")
+    s = s:gsub("(?i)boss", "")
+    s = s:lower()
+
+    if #s < 3 then
+        return nil
+    end
+
+    return s
+end
+
+function NPCController.refreshSpawnCache(force)
+    local now = os.clock()
+    if not force and (now - (State.spawnCache.indexedAt or 0)) < INTERNAL.SPAWN_CACHE_TTL then
+        return State.spawnCache
+    end
+
+    local byKey = {}
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        local n = inst.Name
+        local ln = tostring(n):lower()
+        local isSpawnish = ln:find("spawn", 1, true) ~= nil or ln:find("spawner", 1, true) ~= nil
+
+        if isSpawnish then
+            local cf = nil
+            if inst:IsA("BasePart") then
+                cf = inst.CFrame
+            elseif inst:IsA("Model") then
+                local ok, pivot = pcall(function()
+                    return inst:GetPivot()
+                end)
+                if ok and pivot then
+                    cf = pivot
+                end
+            end
+
+            if cf then
+                local key = NPCController.deriveSpawnKey(n)
+                if key and byKey[key] == nil then
+                    byKey[key] = cf
+                end
+            end
+        end
+    end
+
+    State.spawnCache.byKey = byKey
+    State.spawnCache.indexedAt = now
+    return State.spawnCache
+end
+
+function NPCController.findSpawnCFrameForBaseName(baseName)
+    local key = NPCController.normalizeKey(baseName)
+    if key == "" then
+        return nil
+    end
+
+    NPCController.refreshSpawnCache(false)
+    return State.spawnCache.byKey[key]
 end
 
 function NPCController.isBossName(name)
@@ -1383,6 +1469,15 @@ function FarmController.clearTarget()
     State.LastTarget = "None"
 end
 
+function FarmController.setSpawnTarget(baseName, spawnCF, kindLabel)
+    State.activeTarget = nil
+    State.activeTargetBaseName = tostring(baseName or "Spawn")
+    State.activeTargetKind = kindLabel or "Spawn"
+    State.activeTargetLockCF = spawnCF
+    State.lastLockCFRefreshAt = os.clock()
+    State.LastTarget = tostring(baseName or "Spawn") .. " (spawn)"
+end
+
 function FarmController.setMode(mode)
     mode = tostring(mode or "none")
 
@@ -1545,6 +1640,54 @@ function FarmController.acquireTarget(forceRefresh, exclude)
         State.LastTarget = nextTarget.Name
     else
         FarmController.clearTarget()
+
+        -- Streaming fallback: if the NPC model isn't replicated yet, try teleporting to a spawn marker.
+        -- Only works when the user has selected targets (we need a name to search).
+        local bestSpawnCF = nil
+        local bestSpawnName = nil
+        local bestDist = math.huge
+
+        local function considerSelection(map)
+            for name, enabled in pairs(map) do
+                if enabled then
+                    local cf = NPCController.findSpawnCFrameForBaseName(name)
+                    if cf and refreshCharacterRefs() and hrp then
+                        local d = (hrp.Position - cf.Position).Magnitude
+                        if d < bestDist then
+                            bestDist = d
+                            bestSpawnCF = cf
+                            bestSpawnName = name
+                        end
+                    end
+                end
+            end
+        end
+
+        if State.farmMode == "mobs" then
+            considerSelection(Config.SelectedEnemies)
+        elseif State.farmMode == "bosses" then
+            considerSelection(Config.SelectedBosses)
+        elseif State.farmMode == "all" then
+            considerSelection(Config.SelectedEnemies)
+            considerSelection(Config.SelectedBosses)
+        elseif State.farmMode == "timed" then
+            -- timed bosses are hardcoded names; try those as spawn keys
+            for _, timedName in ipairs(TIMED_BOSS_NAMES) do
+                local cf = NPCController.findSpawnCFrameForBaseName(timedName)
+                if cf and refreshCharacterRefs() and hrp then
+                    local d = (hrp.Position - cf.Position).Magnitude
+                    if d < bestDist then
+                        bestDist = d
+                        bestSpawnCF = cf
+                        bestSpawnName = timedName
+                    end
+                end
+            end
+        end
+
+        if bestSpawnCF then
+            FarmController.setSpawnTarget(bestSpawnName, bestSpawnCF, "Spawn")
+        end
     end
 
     State.lastTargetRefreshAt = os.clock()
@@ -1552,6 +1695,11 @@ function FarmController.acquireTarget(forceRefresh, exclude)
 end
 
 function FarmController.refreshTargetLock(force)
+    -- If we're on a spawn fallback target (no model), keep using the stored CFrame.
+    if not State.activeTarget then
+        return State.activeTargetLockCF
+    end
+
     if not FarmController.shouldKeepTarget(State.activeTarget) then
         return nil
     end
