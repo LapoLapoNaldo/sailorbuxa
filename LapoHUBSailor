@@ -1,2931 +1,686 @@
---[[
-    Lapo Hub - Sailor Piece
-    Refactor:
-    - controladores locais para character, movement, npc, farm, equip, visual, ui e lifecycle
-    - loop central com estado autoritativo
-    - alvo sticky, cache curto de NPCs e reposicionamento com throttle
-    - air hold único e reaplicação segura após respawn
-    - FPS boost agressivo, mas reversível e com proteções melhores
-]]
+local requestFn = syn and syn.request or http_request or request or (http and http.request)
+assert(requestFn, "request function not found")
 
-local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+local function httpGet(url)
+    local res = requestFn({
+        Url = url,
+        Method = "GET"
+    })
+
+    local body = res and (res.Body or res.body)
+    assert(body, "failed to load: " .. tostring(url))
+    return body
+end
+
+local WindUI = loadstring(httpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
-local Lighting = game:GetService("Lighting")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
-local VirtualInputManager = nil
-
-pcall(function()
-    VirtualInputManager = game:GetService("VirtualInputManager")
-end)
-
-local char
-local hum
-local hrp
-
-local TIMED_BOSS_NAMES = {
-    "AizenBoss",
-    "AlucardBoss",
-    "GojoBoss",
-    "JinwooBoss",
-    "StrongestShinobiBoss",
-    "SukunaBoss",
-    "Yamato",
-    "YujiBoss",
-}
-
-local TIMED_BOSS_LOOKUP = {}
-for _, bossName in ipairs(TIMED_BOSS_NAMES) do
-    TIMED_BOSS_LOOKUP[bossName] = true
-end
-
-local SLOT_INFO = {
-    [1] = { Label = "1 - Melee", KeyCode = Enum.KeyCode.One, TypeName = "Melee" },
-    [2] = { Label = "2 - Sword", KeyCode = Enum.KeyCode.Two, TypeName = "Sword" },
-    [3] = { Label = "3 - Fruit", KeyCode = Enum.KeyCode.Three, TypeName = "Fruit" },
-}
-
-local LABEL_TO_SLOT = {}
-for slot, info in pairs(SLOT_INFO) do
-    LABEL_TO_SLOT[info.Label] = slot
-end
-
-local HOLD_POSITION_NAME = "Lapo_AirPosition"
-local HOLD_GYRO_NAME = "Lapo_AirGyro"
-
-local INTERNAL = {
-    NPC_CACHE_TTL = 0.35,
-    TARGET_CF_REFRESH = 0.08,
-    STATUS_REFRESH = 0.60,
-    IDLE_TICK = 0.20,
-    TARGET_LOST_TICK = 0.10,
-    FARM_TICK_MIN = 0.01,
-    TELEPORT_SEGMENT_MAX = 120,
-    TELEPORT_SEGMENT_WAIT = 0.0,
-    LONG_TELEPORT_THRESHOLD = 16,
-    MIN_POSITION_EPSILON = 0.85,
-    REPOSITION_THRESHOLD = 1.2,
-    HARD_REPOSITION_THRESHOLD = 3.0,
-    TELEPORT_COOLDOWN_MIN = 0.0,
-    EQUIP_COOLDOWN = 0.20,
-    HOLD_POSITION_P = 100000,
-    HOLD_POSITION_D = 1450,
-    HOLD_GYRO_P = 100000,
-    HOLD_GYRO_D = 1250,
-    SPAWN_CACHE_TTL = 8.0,
-    ORBIT_REFRESH = 0.03,
-    SAME_PACK_RADIUS = 18,
-}
 
 local Config = {
-    Delay = 0.03,
-    TPDelay = 0.01,
-    BypassTP = false,
-    InfiniteRangeTP = true,
+    FarmMobs = false,
+    FarmBosses = false,
+    Delay = 0.05,
+    SelectedTarget = "Any",
+
     AutoAttack = true,
-    AttackDelay = 0.05,
-    CycleTargets = false,
-    CycleInterval = 2.5,
-
-    SelectedEnemies = {},
-    SelectedBosses = {},
-
-    FarmingEnemies = false,
-    FarmingBosses = false,
-    FarmTimedBosses = false,
-    FarmAllSelected = false,
-
-    DistanceBehind = 4,
-    HeightOffset = 1.5,
-    StaticMode = true,
-
     AutoEquip = false,
-    EquipSlot = 1,
-    EquipLabel = SLOT_INFO[1].Label,
+    EquipSlot = "1 - Melee",
 
+    NoClip = false,
+    AirHold = false,
     FPSBoost = false,
-    FreezeOnFPSBoost = true,
 
-    ThemeName = "Midnight Emerald",
-    PreferPackCenter = true,
-    PackOrbit = true,
-    OrbitRadius = 5.5,
-    OrbitSpeed = 2.8,
-    OrbitHeight = 0.0,
+    TeleportDistance = 3,
+    TeleportHeight = 2.5,
+    EquipCooldown = 0.25,
+    AirHoldPosName = "LapoAirHoldPos",
+    AirHoldGyroName = "LapoAirHoldGyro"
 }
 
 local State = {
-    alive = true,
+    Character = nil,
+    Humanoid = nil,
+    Root = nil,
 
-    farmMode = "none",
-    activeTarget = nil,
-    activeTargetBaseName = nil,
-    activeTargetKind = "None",
-    activeTargetLockCF = nil,
+    Target = nil,
+    TargetName = "None",
 
-    lastTargetRefreshAt = 0,
-    lastLockCFRefreshAt = 0,
-    lastTeleportAt = 0,
-    lastEquipAt = 0,
-    lastAttackAt = 0,
-    lastCycleAt = 0,
-    lastCycleSkip = nil,
-    lastKillAt = 0,
-    lastOrbitAt = 0,
-    orbitAngle = 0,
+    LastEquip = 0,
+    Hidden = {},
 
-    holdEnabled = false,
-    holdTargetCF = nil,
-    fpsBoostEnabled = false,
+    Window = nil,
+    TargetDropdown = nil,
 
-    LastEquipped = SLOT_INFO[1].Label,
-    LastTarget = "None",
-    LastMode = "Idle",
-    lastEquipSlot = nil,
-
-    character = {
-        partCache = {},
-    },
-
-    npcCache = {
-        models = {},
-        timed = {},
-        indexedAt = 0,
-    },
-
-    spawnCache = {
-        byKey = {},
-        indexedAt = 0,
-    },
-
-    ui = {
-        Window = nil,
-        EnemyDropdown = nil,
-        BossDropdown = nil,
-        StatusParagraph = nil,
-        ThemeDropdown = nil,
-        ConfigFile = nil,
-    },
-
-    visual = {
-        visuals = {},
-        hiddenRoots = {},
-        hiddenStorage = nil,
-        lightingProps = {},
-        connections = {},
-    },
-
-    connections = {
-        Hold = nil,
-        NoClip = nil,
-        NoClipDesc = nil,
-        CharacterAdded = nil,
-    },
+    Connections = {}
 }
 
-local CharacterController = {}
-local NPCController = {}
-local EquipController = {}
-local MovementController = {}
-local CombatController = {}
-local VisualController = {}
-local FarmController = {}
-local UIController = {}
-local LifecycleController = {}
-
-local MODE_LABELS = {
-    all = "Farm All Selected",
-    mobs = "Mobs Only",
-    bosses = "Bosses Only",
-    timed = "Timed Bosses",
-    none = "Idle",
+local SlotMap = {
+    ["1 - Melee"] = Enum.KeyCode.One,
+    ["2 - Sword"] = Enum.KeyCode.Two,
+    ["3 - Fruit"] = Enum.KeyCode.Three
 }
 
-local function refreshCharacterRefs(newChar, allowWait)
-    char = newChar or LocalPlayer.Character
-    hum = nil
-    hrp = nil
-
-    if not char then
-        return false
-    end
-
-    hum = char:FindFirstChildOfClass("Humanoid")
-    hrp = char:FindFirstChild("HumanoidRootPart")
-
-    if allowWait then
-        hum = hum or char:WaitForChild("Humanoid", 10)
-        hrp = hrp or char:WaitForChild("HumanoidRootPart", 10)
-    end
-
-    return hum ~= nil and hrp ~= nil
+local function getCharacter()
+    State.Character = LocalPlayer.Character
+    State.Humanoid = State.Character and State.Character:FindFirstChildOfClass("Humanoid") or nil
+    State.Root = State.Character and State.Character:FindFirstChild("HumanoidRootPart") or nil
 end
 
-local function countEnabled(selectionMap)
-    local total = 0
-
-    for _, enabled in pairs(selectionMap) do
-        if enabled then
-            total = total + 1
-        end
-    end
-
-    return total
-end
-
-local function getNPCFolder()
-    local directNames = { "NPCs", "Enemies", "Mobs" }
-
-    for _, folderName in ipairs(directNames) do
-        local folder = Workspace:FindFirstChild(folderName)
-        if folder then
-            return folder
-        end
-    end
-
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        if (inst:IsA("Folder") or inst:IsA("Model")) and table.find(directNames, inst.Name) then
-            return inst
-        end
-    end
-
-    return nil
-end
-
-local function notify(title, content, icon, duration)
-    WindUI:Notify({
-        Title = title,
-        Content = content,
-        Icon = icon,
-        Duration = duration or 3,
-    })
-end
-
-local function applyNoCollisionToPart(part)
-    if not part or not part:IsA("BasePart") then
-        return
-    end
-
-    part.CanCollide = false
-    part.CanTouch = false
-    part.CanQuery = false
-end
-
-function CharacterController.rebuildPartCache()
-    table.clear(State.character.partCache)
-
-    if not char then
-        return
-    end
-
-    for _, inst in ipairs(char:GetDescendants()) do
-        if inst:IsA("BasePart") then
-            State.character.partCache[inst] = true
-            applyNoCollisionToPart(inst)
-        end
-    end
-end
-
-function CharacterController.enableNoClip()
-    if not refreshCharacterRefs() or not char then
-        return
-    end
-
-    CharacterController.rebuildPartCache()
-
-    if State.connections.NoClipDesc then
-        State.connections.NoClipDesc:Disconnect()
-        State.connections.NoClipDesc = nil
-    end
-
-    State.connections.NoClipDesc = char.DescendantAdded:Connect(function(inst)
-        if not inst:IsA("BasePart") then
-            return
-        end
-
-        State.character.partCache[inst] = true
-
-        task.defer(function()
-            if State.alive and char and inst.Parent and inst:IsDescendantOf(char) then
-                applyNoCollisionToPart(inst)
-            end
-        end)
-    end)
-
-    if not State.connections.NoClip then
-        State.connections.NoClip = RunService.Stepped:Connect(function()
-            if not char or not char.Parent then
-                return
-            end
-
-            for part in pairs(State.character.partCache) do
-                if not part or not part.Parent or not part:IsDescendantOf(char) then
-                    State.character.partCache[part] = nil
-                elseif part.CanCollide or part.CanTouch or part.CanQuery then
-                    applyNoCollisionToPart(part)
-                end
-            end
-        end)
-    end
-end
-
-function CharacterController.stopNoClip()
-    if State.connections.NoClip then
-        State.connections.NoClip:Disconnect()
-        State.connections.NoClip = nil
-    end
-
-    if State.connections.NoClipDesc then
-        State.connections.NoClipDesc:Disconnect()
-        State.connections.NoClipDesc = nil
-    end
-end
-
-function NPCController.getBaseName(name)
-    return (tostring(name or ""):gsub("%d+$", ""))
-end
-
-function NPCController.normalizeKey(name)
-    local s = tostring(name or ""):lower()
-    s = s:gsub("%d+$", "")
-    s = s:gsub("[_%-%s]+", "")
-    return s
-end
-
-function NPCController.deriveSpawnKey(rawName)
-    local s = tostring(rawName or "")
-    if s == "" then
-        return nil
-    end
-
-    s = s:gsub("%d+$", "")
-    s = s:gsub("[%[%]%(%)%{%}]", "")
-    s = s:gsub("[_%-%s]+", "")
-    s = s:gsub("(?i)spawnpoint", "")
-    s = s:gsub("(?i)spawner", "")
-    s = s:gsub("(?i)spawn", "")
-    s = s:gsub("(?i)npc", "")
-    s = s:gsub("(?i)mob", "")
-    s = s:gsub("(?i)boss", "")
-    s = s:lower()
-
-    if #s < 3 then
-        return nil
-    end
-
-    return s
-end
-
-function NPCController.refreshSpawnCache(force)
-    local now = os.clock()
-    if not force and (now - (State.spawnCache.indexedAt or 0)) < INTERNAL.SPAWN_CACHE_TTL then
-        return State.spawnCache
-    end
-
-    local byKey = {}
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        local n = inst.Name
-        local ln = tostring(n):lower()
-        local isSpawnish = ln:find("spawn", 1, true) ~= nil or ln:find("spawner", 1, true) ~= nil
-
-        if isSpawnish then
-            local cf = nil
-            if inst:IsA("BasePart") then
-                cf = inst.CFrame
-            elseif inst:IsA("Model") then
-                local ok, pivot = pcall(function()
-                    return inst:GetPivot()
-                end)
-                if ok and pivot then
-                    cf = pivot
-                end
-            end
-
-            if cf then
-                local key = NPCController.deriveSpawnKey(n)
-                if key and byKey[key] == nil then
-                    byKey[key] = cf
-                end
-            end
-        end
-    end
-
-    State.spawnCache.byKey = byKey
-    State.spawnCache.indexedAt = now
-    return State.spawnCache
-end
-
-function NPCController.findSpawnCFrameForBaseName(baseName)
-    local key = NPCController.normalizeKey(baseName)
-    if key == "" then
-        return nil
-    end
-
-    NPCController.refreshSpawnCache(false)
-    return State.spawnCache.byKey[key]
-end
-
-function NPCController.findModelCFrameForBaseName(baseName)
-    local key = NPCController.normalizeKey(baseName)
-    if key == "" then
-        return nil
-    end
-
-    if not refreshCharacterRefs() or not hrp then
-        return nil
-    end
-
-    local bestAnyCF = nil
-    local bestAnyDist = math.huge
-    local bestFiveCF = nil
-    local bestFiveDist = math.huge
-
-    local function computeModelCF(obj)
-        local root = NPCController.getRoot(obj)
-        if root then
-            return root.CFrame
-        end
-
-        local ok, pivot = pcall(function()
-            return obj:GetPivot()
-        end)
-        if ok and pivot then
-            return pivot
-        end
-
-        return nil
-    end
-
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model")
-            and not NPCController.isTrainingDummy(obj)
-            and (not char or not obj:IsDescendantOf(char))
-            and not Players:GetPlayerFromCharacter(obj)
-        then
-            if NPCController.normalizeKey(obj.Name) == key then
-                local cf = computeModelCF(obj)
-                if cf then
-                    local d = (hrp.Position - cf.Position).Magnitude
-                    local isFive = tostring(obj.Name):match("5$") ~= nil
-
-                    if isFive and d < bestFiveDist then
-                        bestFiveDist = d
-                        bestFiveCF = cf
-                    end
-
-                    if d < bestAnyDist then
-                        bestAnyDist = d
-                        bestAnyCF = cf
-                    end
-                end
-            end
-        end
-    end
-
-    return bestFiveCF or bestAnyCF
-end
-
-function NPCController.isBossName(name)
-    return tostring(name or ""):match("Boss$") ~= nil or TIMED_BOSS_LOOKUP[tostring(name or "")] == true
-end
-
-function NPCController.getHumanoid(model)
-    if not model then
-        return nil
-    end
-
-    return model:FindFirstChildOfClass("Humanoid")
-end
-
-function NPCController.getRoot(model)
-    if not model then
-        return nil
-    end
-
+local function getModelRoot(model)
     return model:FindFirstChild("HumanoidRootPart")
-        or model:FindFirstChild("RootPart")
         or model.PrimaryPart
         or model:FindFirstChildWhichIsA("BasePart")
 end
 
-function NPCController.isTrainingDummy(model)
+local function cleanName(name)
+    local s = tostring(name or "")
+    s = s:gsub("%d+$", "")
+    s = s:gsub("%s+$", "")
+    return s ~= "" and s or tostring(name)
+end
+
+local function isAliveNPC(model)
+    if not model or not model:IsA("Model") or not model.Parent then
+        return false
+    end
+
+    if State.Character and model == State.Character then
+        return false
+    end
+
+    if Players:GetPlayerFromCharacter(model) then
+        return false
+    end
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then
+        return false
+    end
+
+    return getModelRoot(model) ~= nil
+end
+
+local function isBoss(model)
     if not model then
         return false
     end
 
-    return model.Name:lower():find("trainingdummy", 1, true) ~= nil
+    local name = string.lower(model.Name)
+    return model:GetAttribute("Boss") == true
+        or model:GetAttribute("IsBoss") == true
+        or name:find("boss", 1, true) ~= nil
 end
 
-function NPCController.isAlive(model)
-    if not model or not model.Parent then
-        return false
-    end
-
-    local npcHum = NPCController.getHumanoid(model)
-    if npcHum then
-        return npcHum.Health > 0
-    end
-
-    return true
-end
-
-function NPCController.isValid(model)
-    if not model or not model.Parent or not model:IsA("Model") then
-        return false
-    end
-
-    if NPCController.isTrainingDummy(model) then
-        return false
-    end
-
-    if not NPCController.isAlive(model) then
-        return false
-    end
-
-    if NPCController.getRoot(model) then
-        return true
-    end
-
-    return pcall(function()
-        return model:GetPivot()
-    end)
-end
-
-function NPCController.isCandidateModel(model)
-    if not model or not model.Parent or not model:IsA("Model") then
-        return false
-    end
-
-    if NPCController.isTrainingDummy(model) then
-        return false
-    end
-
-    return NPCController.getHumanoid(model) ~= nil
-        or NPCController.getRoot(model) ~= nil
-        or model.PrimaryPart ~= nil
-end
-
-function NPCController.collectModels(folder)
-    local result = {}
-    if not folder then
-        return result
-    end
-
-    for _, obj in ipairs(folder:GetChildren()) do
-        if NPCController.isCandidateModel(obj) then
-            table.insert(result, obj)
-        end
-    end
-
-    if #result > 0 then
-        return result
-    end
-
-    local seen = {}
-
-    for _, obj in ipairs(folder:GetDescendants()) do
-        if NPCController.isCandidateModel(obj) and not seen[obj] then
-            seen[obj] = true
-            table.insert(result, obj)
-        end
-    end
-
-    return result
-end
-
-function NPCController.collectFallbackWorkspaceModels()
-    local result = {}
-    local seen = {}
-    local npcFolder = getNPCFolder()
-
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model")
-            and not seen[obj]
-            and not NPCController.isTrainingDummy(obj)
-            and (not char or not obj:IsDescendantOf(char))
-            and not Players:GetPlayerFromCharacter(obj)
-            and (npcFolder == nil or obj:IsDescendantOf(npcFolder) or obj.Name:match("Boss$") or obj:FindFirstChildOfClass("Humanoid"))
-        then
-            if NPCController.isCandidateModel(obj) then
-                seen[obj] = true
-                table.insert(result, obj)
-            end
-        end
-    end
-
-    return result
-end
-
-function NPCController.getSearchModels()
-    local folder = getNPCFolder()
-    local models = NPCController.collectModels(folder)
-
-    if #models > 0 then
-        return models
-    end
-
-    return NPCController.collectFallbackWorkspaceModels()
-end
-
-function NPCController.refreshCache(force)
-    local now = os.clock()
-
-    if not force and (now - State.npcCache.indexedAt) < INTERNAL.NPC_CACHE_TTL then
-        return State.npcCache
-    end
-
-    local validNPCs = {}
-    local timedBosses = {}
-    
-    for _, obj in ipairs(NPCController.getSearchModels()) do
-        if NPCController.isValid(obj) then
-            table.insert(validNPCs, obj)
-
-            if TIMED_BOSS_LOOKUP[obj.Name] then
-                table.insert(timedBosses, obj)
-            end
-        end
-    end
-
-    State.npcCache.models = validNPCs
-    State.npcCache.timed = timedBosses
-    State.npcCache.indexedAt = now
-
-    return State.npcCache
-end
-
-function NPCController.getValidNPCs(force)
-    return NPCController.refreshCache(force).models
-end
-
-function NPCController.getTimedBosses(force)
-    return NPCController.refreshCache(force).timed
-end
-
-function NPCController.getListableNPCs()
+local function scanNPCs()
     local list = {}
-    local seen = {}
 
-    for _, obj in ipairs(NPCController.getSearchModels()) do
-        if not NPCController.isTrainingDummy(obj) and not seen[obj] then
-            seen[obj] = true
-            table.insert(list, obj)
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("Model") and isAliveNPC(inst) then
+            table.insert(list, inst)
         end
     end
 
     return list
 end
 
-function NPCController.getGroupedList(wantBosses, force)
-    local seen = {}
-    local grouped = {}
-
-    NPCController.refreshCache(force)
-
-    for _, npc in ipairs(NPCController.getListableNPCs()) do
-        local isBoss = NPCController.isBossName(npc.Name)
-
-        if wantBosses == isBoss then
-            local baseName = NPCController.getBaseName(npc.Name)
-
-            if baseName ~= "" and not seen[baseName] then
-                seen[baseName] = true
-                table.insert(grouped, baseName)
-            end
-        end
-    end
-
-    table.sort(grouped)
-    return grouped
-end
-
-function NPCController.getDistanceFromCharacter(model)
-    if not refreshCharacterRefs() or not hrp then
-        return math.huge
-    end
-
-    local root = NPCController.getRoot(model)
-    if not root then
-        return math.huge
-    end
-
-    return (hrp.Position - root.Position).Magnitude
-end
-
-function NPCController.getAlivePack(baseName, referencePosition)
-    local result = {}
-    local normalizedBase = NPCController.normalizeKey(baseName)
-
-    for _, npc in ipairs(NPCController.getValidNPCs(false)) do
-        if NPCController.normalizeKey(NPCController.getBaseName(npc.Name)) == normalizedBase then
-            table.insert(result, npc)
-        end
-    end
-
-    if referencePosition and #result > 1 then
-        local filtered = {}
-
-        for _, npc in ipairs(result) do
-            local root = NPCController.getRoot(npc)
-            if root and (root.Position - referencePosition).Magnitude <= INTERNAL.SAME_PACK_RADIUS then
-                table.insert(filtered, npc)
-            end
-        end
-
-        if #filtered > 0 then
-            result = filtered
-        end
-    end
-
-    return result
-end
-
-function NPCController.getPackCenter(baseName, referencePosition)
-    local pack = NPCController.getAlivePack(baseName, referencePosition)
-    if #pack == 0 then
-        return nil, nil, 0
-    end
-
-    local sum = Vector3.zero
-    local count = 0
-    local nearestRoot = nil
-    local nearestDist = math.huge
-
-    for _, npc in ipairs(pack) do
-        local root = NPCController.getRoot(npc)
-        if root then
-            sum += root.Position
-            count += 1
-
-            if referencePosition then
-                local dist = (root.Position - referencePosition).Magnitude
-                if dist < nearestDist then
-                    nearestDist = dist
-                    nearestRoot = root
-                end
-            end
-        end
-    end
-
-    if count == 0 then
-        return nil, nil, 0
-    end
-
-    return (sum / count), nearestRoot, count
-end
-
-function NPCController.findNearestValidAny()
-    local best = nil
-    local bestDist = math.huge
-
-    for _, npc in ipairs(NPCController.getValidNPCs(true)) do
-        local d = NPCController.getDistanceFromCharacter(npc)
-        if d < bestDist then
-            bestDist = d
-            best = npc
-        end
-    end
-
-    if best then
-        return best, bestDist
-    end
-
-    for _, npc in ipairs(NPCController.getListableNPCs()) do
-        if NPCController.isValid(npc) then
-            local d = NPCController.getDistanceFromCharacter(npc)
-            if d < bestDist then
-                bestDist = d
-                best = npc
-            end
-        end
-    end
-
-    return best, bestDist
-end
-
-function EquipController.getEquippedTool()
-    if not refreshCharacterRefs() or not char then
-        return nil
-    end
-
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj:IsA("Tool") then
-            return obj
-        end
-    end
-
-    return nil
-end
-
-function EquipController.weaponMatches(tool, weaponType)
-    if not tool or not tool:IsA("Tool") then
+local function isAllowedTarget(model)
+    if not isAliveNPC(model) then
         return false
     end
 
-    local toolName = tool.Name:lower()
-    local targetType = tostring(weaponType or ""):lower()
+    local boss = isBoss(model)
 
-    if toolName == targetType then
-        return true
+    if boss and not Config.FarmBosses then
+        return false
     end
 
-    if targetType == "melee" then
-        return toolName:find("melee", 1, true) ~= nil
-            or toolName:find("combat", 1, true) ~= nil
-            or toolName:find("fist", 1, true) ~= nil
-            or toolName:find("style", 1, true) ~= nil
+    if not boss and not Config.FarmMobs then
+        return false
     end
 
-    if targetType == "sword" then
-        return toolName:find("sword", 1, true) ~= nil
-            or toolName:find("blade", 1, true) ~= nil
-            or toolName:find("katana", 1, true) ~= nil
-    end
-
-    if targetType == "fruit" then
-        return toolName:find("fruit", 1, true) ~= nil
-            or toolName:find("devil", 1, true) ~= nil
-    end
-
-    return false
-end
-
-function EquipController.findWeaponTool(weaponType)
-    if not refreshCharacterRefs() then
-        return nil
-    end
-
-    local backpack = LocalPlayer:FindFirstChild("Backpack")
-
-    for _, container in ipairs({ char, backpack }) do
-        if container then
-            for _, obj in ipairs(container:GetChildren()) do
-                if EquipController.weaponMatches(obj, weaponType) then
-                    return obj
-                end
-            end
+    if Config.SelectedTarget ~= "Any" then
+        local name = cleanName(model.Name)
+        if name ~= Config.SelectedTarget and model.Name ~= Config.SelectedTarget then
+            return false
         end
-    end
-
-    return nil
-end
-
-function EquipController.tapSlot(slot)
-    local info = SLOT_INFO[slot]
-    if not info then
-        return false
-    end
-
-    if VirtualInputManager then
-        local ok = pcall(function()
-            VirtualInputManager:SendKeyEvent(true, info.KeyCode, false, game)
-            task.wait()
-            VirtualInputManager:SendKeyEvent(false, info.KeyCode, false, game)
-        end)
-
-        if ok then
-            return true
-        end
-    end
-
-    local virtualKeyBySlot = {
-        [1] = 0x31,
-        [2] = 0x32,
-        [3] = 0x33,
-    }
-
-    if typeof(keypress) == "function" and typeof(keyrelease) == "function" and virtualKeyBySlot[slot] then
-        local ok = pcall(function()
-            keypress(virtualKeyBySlot[slot])
-            task.wait()
-            keyrelease(virtualKeyBySlot[slot])
-        end)
-
-        if ok then
-            return true
-        end
-    end
-
-    return false
-end
-
-function EquipController.setSelection(value)
-    if typeof(value) == "table" then
-        value = value[1]
-    end
-
-    local slot = LABEL_TO_SLOT[value]
-    if not slot then
-        slot = tonumber(tostring(value):match("^(%d+)")) or 1
-    end
-
-    slot = math.clamp(slot, 1, 3)
-    Config.EquipSlot = slot
-    Config.EquipLabel = SLOT_INFO[slot].Label
-    State.lastEquipSlot = nil
-end
-
-function EquipController.equipSelected(force)
-    if not force and not Config.AutoEquip then
-        return false
-    end
-
-    if not refreshCharacterRefs() or not hum then
-        return false
-    end
-
-    local now = os.clock()
-    local slotInfo = SLOT_INFO[Config.EquipSlot] or SLOT_INFO[1]
-    local currentTool = EquipController.getEquippedTool()
-
-    if currentTool and EquipController.weaponMatches(currentTool, slotInfo.TypeName) then
-        State.LastEquipped = currentTool.Name
-        State.lastEquipSlot = Config.EquipSlot
-        return true
-    end
-
-    if not force and (now - State.lastEquipAt) < INTERNAL.EQUIP_COOLDOWN then
-        return false
-    end
-
-    State.lastEquipAt = now
-
-    if currentTool then
-        pcall(function()
-            hum:UnequipTools()
-        end)
-    end
-
-    if EquipController.tapSlot(Config.EquipSlot) then
-        task.wait(0.04)
-
-        local tappedTool = EquipController.getEquippedTool()
-        if tappedTool and EquipController.weaponMatches(tappedTool, slotInfo.TypeName) then
-            State.LastEquipped = tappedTool.Name
-            State.lastEquipSlot = Config.EquipSlot
-            return true
-        end
-    end
-
-    local fallbackTool = EquipController.findWeaponTool(slotInfo.TypeName)
-    if fallbackTool then
-        pcall(function()
-            hum:EquipTool(fallbackTool)
-        end)
-
-        task.wait(0.03)
-
-        local equippedTool = EquipController.getEquippedTool()
-        if equippedTool and EquipController.weaponMatches(equippedTool, slotInfo.TypeName) then
-            State.LastEquipped = equippedTool.Name
-            State.lastEquipSlot = Config.EquipSlot
-            return true
-        end
-    end
-
-    State.LastEquipped = slotInfo.Label .. " (failed)"
-    return false
-end
-
-function CombatController.getAttackCooldown()
-    local cd = tonumber(Config.AttackDelay) or 0.08
-    return math.clamp(cd, 0, 0.4)
-end
-
-function CombatController.tryActivateTool()
-    if not Config.AutoAttack then
-        return false
-    end
-
-    if not refreshCharacterRefs() or not char or not hum or hum.Health <= 0 then
-        return false
-    end
-
-    local now = os.clock()
-    if (now - (State.lastAttackAt or 0)) < CombatController.getAttackCooldown() then
-        return false
-    end
-
-    local tool = EquipController.getEquippedTool()
-    if not tool and Config.AutoEquip then
-        EquipController.equipSelected(false)
-        tool = EquipController.getEquippedTool()
-    end
-
-    if not tool then
-        return false
-    end
-
-    State.lastAttackAt = now
-    return pcall(function()
-        tool:Activate()
-    end)
-end
-
-function MovementController.zeroVelocity()
-    if not hrp then
-        return
-    end
-
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
-end
-
-function MovementController.ensureHoldInstances()
-    if not refreshCharacterRefs() or not hrp then
-        return nil, nil
-    end
-
-    local bodyPosition = hrp:FindFirstChild(HOLD_POSITION_NAME)
-    local bodyGyro = hrp:FindFirstChild(HOLD_GYRO_NAME)
-
-    if not bodyPosition then
-        bodyPosition = Instance.new("BodyPosition")
-        bodyPosition.Name = HOLD_POSITION_NAME
-        bodyPosition.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-        bodyPosition.P = INTERNAL.HOLD_POSITION_P
-        bodyPosition.D = INTERNAL.HOLD_POSITION_D
-        bodyPosition.Parent = hrp
-    end
-
-    if not bodyGyro then
-        bodyGyro = Instance.new("BodyGyro")
-        bodyGyro.Name = HOLD_GYRO_NAME
-        bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-        bodyGyro.P = INTERNAL.HOLD_GYRO_P
-        bodyGyro.D = INTERNAL.HOLD_GYRO_D
-        bodyGyro.Parent = hrp
-    end
-
-    return bodyPosition, bodyGyro
-end
-
-function MovementController.destroyHoldInstances()
-    if not hrp then
-        return
-    end
-
-    local bodyPosition = hrp:FindFirstChild(HOLD_POSITION_NAME)
-    local bodyGyro = hrp:FindFirstChild(HOLD_GYRO_NAME)
-
-    if bodyPosition then
-        bodyPosition:Destroy()
-    end
-
-    if bodyGyro then
-        bodyGyro:Destroy()
-    end
-end
-
-function MovementController.updateHoldTarget(targetCF)
-    if not targetCF or not refreshCharacterRefs() or not hrp then
-        return
-    end
-
-    State.holdTargetCF = targetCF
-
-    if not State.holdEnabled then
-        return
-    end
-
-    local bodyPosition, bodyGyro = MovementController.ensureHoldInstances()
-    if not bodyPosition or not bodyGyro then
-        return
-    end
-
-    bodyPosition.Position = targetCF.Position
-    bodyGyro.CFrame = targetCF
-
-    MovementController.zeroVelocity()
-
-    if hum then
-        hum.AutoRotate = false
-        hum.Sit = false
-    end
-end
-
-function MovementController.setHoldState(enabled, targetCF)
-    if enabled then
-        State.holdEnabled = true
-        MovementController.updateHoldTarget(targetCF or (hrp and hrp.CFrame or nil))
-
-        if not State.connections.Hold then
-            State.connections.Hold = RunService.Heartbeat:Connect(function()
-                if not State.holdEnabled then
-                    return
-                end
-
-                if not refreshCharacterRefs() or not hrp then
-                    return
-                end
-
-                local desiredCF = State.holdTargetCF or hrp.CFrame
-                local bodyPosition, bodyGyro = MovementController.ensureHoldInstances()
-
-                if not bodyPosition or not bodyGyro then
-                    return
-                end
-
-                bodyPosition.Position = desiredCF.Position
-                bodyGyro.CFrame = desiredCF
-
-                if hrp.AssemblyLinearVelocity.Magnitude > 0.01 or hrp.AssemblyAngularVelocity.Magnitude > 0.01 then
-                    MovementController.zeroVelocity()
-                end
-
-                if hum then
-                    hum.AutoRotate = false
-                    hum.Sit = false
-                end
-            end)
-        end
-
-        return
-    end
-
-    State.holdEnabled = false
-    State.holdTargetCF = nil
-
-    if State.connections.Hold then
-        State.connections.Hold:Disconnect()
-        State.connections.Hold = nil
-    end
-
-    if hum then
-        hum.AutoRotate = true
-    end
-
-    MovementController.destroyHoldInstances()
-end
-
-function MovementController.shouldUseHold()
-    return ((FarmController.isEnabled() and Config.StaticMode and State.activeTargetLockCF ~= nil) or (State.fpsBoostEnabled and Config.FreezeOnFPSBoost))
-end
-
-function MovementController.syncHoldState()
-    if MovementController.shouldUseHold() then
-        local desiredCF = State.activeTargetLockCF
-        if not desiredCF and hrp then
-            desiredCF = hrp.CFrame
-        end
-
-        MovementController.setHoldState(true, desiredCF)
-        return
-    end
-
-    MovementController.setHoldState(false)
-end
-
-function MovementController.getOrbitAngle()
-    local now = os.clock()
-    local dt = math.max(0, now - (State.lastOrbitAt or now))
-    State.lastOrbitAt = now
-    State.orbitAngle = (State.orbitAngle + ((tonumber(Config.OrbitSpeed) or 0) * dt * math.pi * 2)) % (math.pi * 2)
-    return State.orbitAngle
-end
-
-function MovementController.getTargetCFrameForNPC(npc)
-    if not NPCController.isValid(npc) then
-        return nil
-    end
-
-    local root = NPCController.getRoot(npc)
-    local sourceCF
-    local focusPosition
-
-    if root then
-        sourceCF = root.CFrame
-        focusPosition = root.Position
-    else
-        local ok, pivot = pcall(function()
-            return npc:GetPivot()
-        end)
-
-        if not ok or not pivot then
-            return nil
-        end
-
-        sourceCF = pivot
-        focusPosition = pivot.Position
-    end
-
-    local baseName = State.activeTargetBaseName or NPCController.getBaseName(npc.Name)
-    local packCenter, nearestRoot, packCount = nil, nil, 0
-
-    if Config.PreferPackCenter and baseName ~= "" then
-        packCenter, nearestRoot, packCount = NPCController.getPackCenter(baseName, focusPosition)
-    end
-
-    if packCenter then
-        focusPosition = packCenter
-        if nearestRoot then
-            sourceCF = nearestRoot.CFrame
-        end
-    end
-
-    local finalPos
-
-    if Config.PackOrbit and packCount > 1 then
-        local angle = MovementController.getOrbitAngle()
-        local radius = math.max(1.5, tonumber(Config.OrbitRadius) or 5.5)
-        local orbitOffset = Vector3.new(
-            math.cos(angle) * radius,
-            Config.HeightOffset + (tonumber(Config.OrbitHeight) or 0),
-            math.sin(angle) * radius
-        )
-        finalPos = focusPosition + orbitOffset
-    else
-        finalPos = sourceCF.Position - (sourceCF.LookVector * Config.DistanceBehind) + Vector3.new(0, Config.HeightOffset, 0)
-    end
-
-    return CFrame.new(finalPos, focusPosition)
-end
-
-function MovementController.getTeleportCooldown()
-    local d = tonumber(Config.TPDelay) or 0
-    return math.clamp(d, 0, 0.5)
-end
-
-function MovementController.shouldReposition(targetCF)
-    if not targetCF or not refreshCharacterRefs() or not hrp then
-        return false
-    end
-
-    local distance = (hrp.Position - targetCF.Position).Magnitude
-
-    if distance <= INTERNAL.MIN_POSITION_EPSILON then
-        return false
-    end
-
-    if distance >= INTERNAL.REPOSITION_THRESHOLD then
-        return true
-    end
-
-    return not State.holdEnabled
-end
-
-function MovementController.safePivotTo(targetCF, force)
-    if not targetCF or not refreshCharacterRefs() or not char or not hrp then
-        return false
-    end
-
-    if hum then
-        hum.Sit = false
-        hum.PlatformStand = false
-        pcall(function()
-            hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics)
-        end)
-    end
-
-    if hrp.Anchored then
-        pcall(function()
-            hrp.Anchored = false
-        end)
-    end
-
-    local distance = (hrp.Position - targetCF.Position).Magnitude
-
-    if distance <= INTERNAL.MIN_POSITION_EPSILON and not force then
-        if State.holdEnabled then
-            MovementController.updateHoldTarget(targetCF)
-        end
-        return false
-    end
-
-    local now = os.clock()
-    if not force and (now - State.lastTeleportAt) < MovementController.getTeleportCooldown() and distance < INTERNAL.HARD_REPOSITION_THRESHOLD then
-        if State.holdEnabled then
-            MovementController.updateHoldTarget(targetCF)
-        end
-        return false
-    end
-
-    if not State.connections.NoClip or not State.connections.NoClipDesc then
-        CharacterController.enableNoClip()
-    end
-
-    if Config.BypassTP and distance > INTERNAL.LONG_TELEPORT_THRESHOLD then
-        local currentPosition = hrp.Position
-        local finalPosition = targetCF.Position
-        local steps = math.clamp(math.ceil(distance / INTERNAL.TELEPORT_SEGMENT_MAX), 1, 12)
-
-        for i = 1, (steps - 1) do
-            if not State.alive or not char or not char.Parent then
-                break
-            end
-
-            local alpha = i / steps
-            local stepPosition = currentPosition:Lerp(finalPosition, alpha)
-            local stepCF = CFrame.new(stepPosition, finalPosition)
-
-            pcall(function()
-                hrp.CFrame = stepCF
-            end)
-            pcall(function()
-                char:PivotTo(stepCF)
-            end)
-
-            MovementController.zeroVelocity()
-
-            if State.holdEnabled then
-                MovementController.updateHoldTarget(stepCF)
-            end
-
-            if INTERNAL.TELEPORT_SEGMENT_WAIT > 0 then
-                task.wait(INTERNAL.TELEPORT_SEGMENT_WAIT)
-            end
-        end
-    end
-
-    pcall(function()
-        hrp.CFrame = targetCF
-    end)
-    pcall(function()
-        char:PivotTo(targetCF)
-    end)
-    MovementController.zeroVelocity()
-
-    State.lastTeleportAt = os.clock()
-
-    if State.holdEnabled then
-        MovementController.updateHoldTarget(targetCF)
     end
 
     return true
 end
 
-function MovementController.moveToward(targetCF)
-    if not targetCF then
-        return false
+local function acquireTarget()
+    if not State.Root then
+        return nil
     end
 
-    if MovementController.shouldReposition(targetCF) then
-        return MovementController.safePivotTo(targetCF, false)
+    local best, bestDist = nil, math.huge
+
+    for _, npc in ipairs(scanNPCs()) do
+        if isAllowedTarget(npc) then
+            local root = getModelRoot(npc)
+            if root then
+                local dist = (State.Root.Position - root.Position).Magnitude
+                if dist < bestDist then
+                    bestDist = dist
+                    best = npc
+                end
+            end
+        end
     end
 
-    if State.holdEnabled then
-        MovementController.updateHoldTarget(targetCF)
-    end
-
-    return false
+    return best
 end
 
-local function rememberVisualProperty(inst, propertyName)
-    local bucket = State.visual.visuals[inst]
-    if not bucket then
-        bucket = {}
-        State.visual.visuals[inst] = bucket
+local function resolveTarget()
+    if isAllowedTarget(State.Target) then
+        return State.Target
     end
 
-    if bucket[propertyName] == nil then
-        local ok, value = pcall(function()
-            return inst[propertyName]
+    State.Target = acquireTarget()
+    State.TargetName = State.Target and State.Target.Name or "None"
+    return State.Target
+end
+
+local function getTargetCFrame(npc)
+    local root = npc and getModelRoot(npc)
+    if not root then
+        return nil
+    end
+
+    local pos = root.Position - (root.CFrame.LookVector * Config.TeleportDistance) + Vector3.new(0, Config.TeleportHeight, 0)
+    return CFrame.new(pos, root.Position)
+end
+
+local function teleportToTarget(npc)
+    if not State.Root then
+        return
+    end
+
+    local cf = getTargetCFrame(npc)
+    if cf then
+        State.Root.CFrame = cf
+    end
+end
+
+local function getEquippedTool()
+    return State.Character and State.Character:FindFirstChildOfClass("Tool") or nil
+end
+
+local function tapEquipSlot()
+    if not Config.AutoEquip then
+        return
+    end
+
+    local now = tick()
+    if now - State.LastEquip < Config.EquipCooldown then
+        return
+    end
+
+    local key = SlotMap[Config.EquipSlot]
+    if not key then
+        return
+    end
+
+    State.LastEquip = now
+
+    VirtualInputManager:SendKeyEvent(true, key, false, game)
+    task.wait()
+    VirtualInputManager:SendKeyEvent(false, key, false, game)
+end
+
+local function attack()
+    if not Config.AutoAttack then
+        return
+    end
+
+    local tool = getEquippedTool()
+    if tool then
+        pcall(function()
+            tool:Activate()
         end)
+    end
+end
 
-        if ok then
-            bucket[propertyName] = value
+local function disableAirHold(oldChar)
+    local char = oldChar or State.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+
+    if root then
+        local bp = root:FindFirstChild(Config.AirHoldPosName)
+        local bg = root:FindFirstChild(Config.AirHoldGyroName)
+
+        if bp then
+            bp:Destroy()
+        end
+
+        if bg then
+            bg:Destroy()
         end
     end
-end
 
-local function rememberLightingProperty(key, value)
-    if State.visual.lightingProps[key] == nil then
-        State.visual.lightingProps[key] = value
+    if State.Humanoid then
+        State.Humanoid.AutoRotate = true
     end
 end
 
-function VisualController.disconnectConnections()
-    for _, connection in ipairs(State.visual.connections) do
-        if connection then
-            connection:Disconnect()
-        end
+local function holdInAir(cf)
+    if not Config.AirHold or not State.Root then
+        disableAirHold()
+        return
     end
 
-    table.clear(State.visual.connections)
+    local bp = State.Root:FindFirstChild(Config.AirHoldPosName)
+    local bg = State.Root:FindFirstChild(Config.AirHoldGyroName)
+
+    if not bp then
+        bp = Instance.new("BodyPosition")
+        bp.Name = Config.AirHoldPosName
+        bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+        bp.P = 100000
+        bp.D = 1250
+        bp.Parent = State.Root
+    end
+
+    if not bg then
+        bg = Instance.new("BodyGyro")
+        bg.Name = Config.AirHoldGyroName
+        bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+        bg.P = 100000
+        bg.D = 1250
+        bg.Parent = State.Root
+    end
+
+    bp.Position = cf.Position
+    bg.CFrame = cf
+
+    State.Root.AssemblyLinearVelocity = Vector3.zero
+    State.Root.AssemblyAngularVelocity = Vector3.zero
+
+    if State.Humanoid then
+        State.Humanoid.AutoRotate = false
+        State.Humanoid.Sit = false
+    end
 end
 
-function VisualController.getHiddenStorage()
-    if not State.visual.hiddenStorage then
-        local folder = Instance.new("Folder")
-        folder.Name = "Lapo_FPSHiddenStorage"
-        State.visual.hiddenStorage = folder
+local function remember(inst, prop)
+    State.Hidden[inst] = State.Hidden[inst] or {}
+    if State.Hidden[inst][prop] == nil then
+        State.Hidden[inst][prop] = inst[prop]
     end
-
-    return State.visual.hiddenStorage
 end
 
-function VisualController.getWorkspaceRoot(inst)
-    local current = inst
-
-    while current and current.Parent and current.Parent ~= Workspace do
-        current = current.Parent
-    end
-
-    if current and current.Parent == Workspace then
-        return current
-    end
-
-    return nil
-end
-
-function VisualController.isProtectedInstance(inst)
-    if not inst then
+local function isProtectedWorkspaceRoot(root)
+    if not root or not root.Parent then
         return true
     end
 
-    if inst == Workspace.CurrentCamera then
+    if root == Workspace.CurrentCamera then
         return true
     end
 
-    if inst:IsA("Terrain") then
+    if root:IsA("Terrain") then
         return true
     end
 
-    if char and inst:IsDescendantOf(char) then
+    if State.Character and (root == State.Character or root:IsDescendantOf(State.Character)) then
         return true
     end
 
-    if inst:IsA("Model") and Players:GetPlayerFromCharacter(inst) then
+    if Players:GetPlayerFromCharacter(root) then
         return true
     end
 
-    local npcFolder = getNPCFolder()
-    if npcFolder and (inst == npcFolder or inst:IsDescendantOf(npcFolder)) then
+    local humanoid = root:FindFirstChildWhichIsA("Humanoid", true)
+    if humanoid then
         return true
     end
 
     return false
 end
 
-function VisualController.hideWorkspaceRoot(root)
-    if not State.fpsBoostEnabled or not root or not root.Parent then
-        return false
-    end
-
-    if VisualController.isProtectedInstance(root) or State.visual.hiddenRoots[root] then
-        return false
-    end
-
-    local hiddenStorage = VisualController.getHiddenStorage()
-    local originalParent = root.Parent
-    local ok = pcall(function()
-        root.Parent = hiddenStorage
-    end)
-
-    if ok and root.Parent == hiddenStorage then
-        State.visual.hiddenRoots[root] = originalParent
-        return true
-    end
-
-    return false
-end
-
-function VisualController.stripWorkspaceVisual(inst)
-    if not State.fpsBoostEnabled or not inst then
+local function hideRoot(root)
+    if isProtectedWorkspaceRoot(root) then
         return
     end
 
-    local workspaceRoot = inst.Parent == Workspace and inst or VisualController.getWorkspaceRoot(inst)
-    if workspaceRoot and VisualController.hideWorkspaceRoot(workspaceRoot) then
-        return
-    end
-
-    if inst:IsA("Terrain") then
-        rememberLightingProperty("TerrainDecoration", inst.Decoration)
-        rememberLightingProperty("TerrainWaterWaveSize", inst.WaterWaveSize)
-        rememberLightingProperty("TerrainWaterWaveSpeed", inst.WaterWaveSpeed)
-        rememberLightingProperty("TerrainWaterTransparency", inst.WaterTransparency)
-
-        inst.Decoration = false
-        inst.WaterWaveSize = 0
-        inst.WaterWaveSpeed = 0
-        inst.WaterTransparency = 1
-    end
-end
-
-function VisualController.stripLightingVisual(inst)
-    if not State.fpsBoostEnabled or not inst then
-        return
-    end
-
-    if inst:IsA("PostEffect") then
-        rememberVisualProperty(inst, "Enabled")
-        inst.Enabled = false
-    elseif inst:IsA("Atmosphere") then
-        rememberVisualProperty(inst, "Density")
-        rememberVisualProperty(inst, "Haze")
-        rememberVisualProperty(inst, "Glare")
-        inst.Density = 0
-        inst.Haze = 0
-        inst.Glare = 0
-    elseif inst:IsA("Clouds") then
-        rememberVisualProperty(inst, "Enabled")
-        inst.Enabled = false
-    end
-end
-
-function VisualController.restore()
-    VisualController.disconnectConnections()
-
-    for inst, originalParent in pairs(State.visual.hiddenRoots) do
-        if inst and originalParent then
-            pcall(function()
-                inst.Parent = originalParent
-            end)
+    for _, inst in ipairs(root:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            remember(inst, "LocalTransparencyModifier")
+            inst.LocalTransparencyModifier = 1
+        elseif inst:IsA("Decal") or inst:IsA("Texture") then
+            remember(inst, "Transparency")
+            inst.Transparency = 1
+        elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") then
+            remember(inst, "Enabled")
+            inst.Enabled = false
         end
     end
 
-    table.clear(State.visual.hiddenRoots)
+    if root:IsA("BasePart") then
+        remember(root, "LocalTransparencyModifier")
+        root.LocalTransparencyModifier = 1
+    end
+end
 
-    for inst, properties in pairs(State.visual.visuals) do
-        if inst then
-            for propertyName, originalValue in pairs(properties) do
+local function restoreFPSBoost()
+    for inst, props in pairs(State.Hidden) do
+        if inst and inst.Parent then
+            for prop, value in pairs(props) do
                 pcall(function()
-                    inst[propertyName] = originalValue
+                    inst[prop] = value
                 end)
             end
         end
     end
 
-    table.clear(State.visual.visuals)
+    table.clear(State.Hidden)
+end
 
-    local terrain = Workspace:FindFirstChildOfClass("Terrain")
-    for key, value in pairs(State.visual.lightingProps) do
-        pcall(function()
-            if key == "GlobalShadows" then
-                Lighting.GlobalShadows = value
-            elseif key == "TerrainDecoration" and terrain then
-                terrain.Decoration = value
-            elseif key == "TerrainWaterWaveSize" and terrain then
-                terrain.WaterWaveSize = value
-            elseif key == "TerrainWaterWaveSpeed" and terrain then
-                terrain.WaterWaveSpeed = value
-            elseif key == "TerrainWaterTransparency" and terrain then
-                terrain.WaterTransparency = value
+local function applyFPSBoost()
+    restoreFPSBoost()
+
+    if not Config.FPSBoost then
+        return
+    end
+
+    for _, root in ipairs(Workspace:GetChildren()) do
+        hideRoot(root)
+    end
+end
+
+local function getTargetOptions()
+    local seen = { Any = true }
+    local values = { "Any" }
+
+    for _, npc in ipairs(scanNPCs()) do
+        local name = cleanName(npc.Name)
+        if not seen[name] then
+            seen[name] = true
+            table.insert(values, name)
+        end
+    end
+
+    table.sort(values, function(a, b)
+        if a == "Any" then
+            return true
+        end
+        if b == "Any" then
+            return false
+        end
+        return a < b
+    end)
+
+    return values
+end
+
+local function refreshTargetDropdown()
+    if State.TargetDropdown then
+        State.TargetDropdown:Refresh(getTargetOptions())
+    end
+end
+
+local function resetCharacter(newChar)
+    disableAirHold(State.Character)
+
+    State.Character = newChar or LocalPlayer.Character
+    State.Humanoid = nil
+    State.Root = nil
+    State.Target = nil
+    State.TargetName = "None"
+    State.LastEquip = 0
+
+    if State.Character then
+        State.Humanoid = State.Character:WaitForChild("Humanoid", 10)
+        State.Root = State.Character:WaitForChild("HumanoidRootPart", 10)
+    end
+
+    if Config.FPSBoost then
+        applyFPSBoost()
+    end
+
+    refreshTargetDropdown()
+end
+
+getCharacter()
+
+local Window = WindUI:CreateWindow({
+    Title = "Lapo Hub - Sailor Piece",
+    Icon = "swords",
+    Author = "WaveAI",
+    Folder = "LapoHubSailorPiece",
+    Size = UDim2.fromOffset(600, 420),
+    MinSize = Vector2.new(560, 400),
+    MaxSize = Vector2.new(900, 700),
+    ToggleKey = Enum.KeyCode.RightShift,
+    Transparent = true,
+    Theme = "Dark",
+    Resizable = true,
+    SideBarWidth = 200
+})
+
+State.Window = Window
+
+local FarmTab = Window:Tab({ Title = "Farm", Icon = "crosshair" })
+local CombatTab = Window:Tab({ Title = "Combat", Icon = "swords" })
+local MiscTab = Window:Tab({ Title = "Misc", Icon = "settings" })
+
+local FarmSection = FarmTab:Section({
+    Title = "Farm",
+    Box = true,
+    Opened = true,
+    TextXAlignment = "Center"
+})
+
+FarmSection:Toggle({
+    Title = "Farm Mobs",
+    Value = Config.FarmMobs,
+    Callback = function(v)
+        Config.FarmMobs = v
+        if not v and not Config.FarmBosses then
+            State.Target = nil
+            State.TargetName = "None"
+        end
+    end
+})
+
+FarmSection:Toggle({
+    Title = "Farm Bosses",
+    Value = Config.FarmBosses,
+    Callback = function(v)
+        Config.FarmBosses = v
+        if not v and not Config.FarmMobs then
+            State.Target = nil
+            State.TargetName = "None"
+        end
+    end
+})
+
+FarmSection:Slider({
+    Title = "Delay",
+    Step = 0.01,
+    Value = { Min = 0.01, Max = 0.30, Default = Config.Delay },
+    Callback = function(v)
+        Config.Delay = v
+    end
+})
+
+State.TargetDropdown = FarmSection:Dropdown({
+    Title = "Target",
+    Values = getTargetOptions(),
+    Value = Config.SelectedTarget,
+    Multi = false,
+    AllowNone = false,
+    SearchBarEnabled = true,
+    Callback = function(v)
+        if typeof(v) == "table" then
+            v = v[1]
+        end
+
+        Config.SelectedTarget = v or "Any"
+        State.Target = nil
+        State.TargetName = "None"
+    end
+})
+
+local CombatSection = CombatTab:Section({
+    Title = "Combat",
+    Box = true,
+    Opened = true,
+    TextXAlignment = "Center"
+})
+
+CombatSection:Toggle({
+    Title = "Auto Attack",
+    Value = Config.AutoAttack,
+    Callback = function(v)
+        Config.AutoAttack = v
+    end
+})
+
+CombatSection:Toggle({
+    Title = "Auto Equip",
+    Value = Config.AutoEquip,
+    Callback = function(v)
+        Config.AutoEquip = v
+    end
+})
+
+CombatSection:Dropdown({
+    Title = "Equip Slot",
+    Values = { "1 - Melee", "2 - Sword", "3 - Fruit" },
+    Value = Config.EquipSlot,
+    Multi = false,
+    AllowNone = false,
+    Callback = function(v)
+        if typeof(v) == "table" then
+            v = v[1]
+        end
+
+        Config.EquipSlot = v or "1 - Melee"
+    end
+})
+
+local MiscSection = MiscTab:Section({
+    Title = "Character",
+    Box = true,
+    Opened = true,
+    TextXAlignment = "Center"
+})
+
+MiscSection:Toggle({
+    Title = "NoClip",
+    Value = Config.NoClip,
+    Callback = function(v)
+        Config.NoClip = v
+    end
+})
+
+MiscSection:Toggle({
+    Title = "Air Hold",
+    Value = Config.AirHold,
+    Callback = function(v)
+        Config.AirHold = v
+        if not v then
+            disableAirHold()
+        elseif State.Root then
+            holdInAir(State.Root.CFrame)
+        end
+    end
+})
+
+MiscSection:Toggle({
+    Title = "FPS Boost",
+    Value = Config.FPSBoost,
+    Callback = function(v)
+        Config.FPSBoost = v
+        applyFPSBoost()
+    end
+})
+
+MiscSection:Button({
+    Title = "Refresh Targets",
+    Icon = "refresh-cw",
+    Callback = function()
+        refreshTargetDropdown()
+    end
+})
+
+State.Connections.CharacterAdded = LocalPlayer.CharacterAdded:Connect(function(char)
+    resetCharacter(char)
+end)
+
+State.Connections.CharacterRemoving = LocalPlayer.CharacterRemoving:Connect(function(char)
+    disableAirHold(char)
+    State.Target = nil
+    State.TargetName = "None"
+end)
+
+State.Connections.WorkspaceAdded = Workspace.ChildAdded:Connect(function(child)
+    if Config.FPSBoost then
+        task.defer(function()
+            if Config.FPSBoost and child and child.Parent == Workspace then
+                hideRoot(child)
             end
         end)
     end
-
-    table.clear(State.visual.lightingProps)
-
-    if State.visual.hiddenStorage then
-        State.visual.hiddenStorage:Destroy()
-        State.visual.hiddenStorage = nil
-    end
-end
-
-function VisualController.apply(state)
-    State.fpsBoostEnabled = state
-
-    if state then
-        VisualController.restore()
-
-        rememberLightingProperty("GlobalShadows", Lighting.GlobalShadows)
-        Lighting.GlobalShadows = false
-
-        for _, inst in ipairs(Workspace:GetChildren()) do
-            VisualController.stripWorkspaceVisual(inst)
-        end
-
-        local terrain = Workspace:FindFirstChildOfClass("Terrain")
-        if terrain then
-            VisualController.stripWorkspaceVisual(terrain)
-        end
-
-        for _, inst in ipairs(Lighting:GetDescendants()) do
-            VisualController.stripLightingVisual(inst)
-        end
-
-        table.insert(State.visual.connections, Workspace.ChildAdded:Connect(function(inst)
-            if not State.fpsBoostEnabled then
-                return
-            end
-
-            task.defer(function()
-                if State.fpsBoostEnabled then
-                    VisualController.stripWorkspaceVisual(inst)
-                end
-            end)
-        end))
-
-        table.insert(State.visual.connections, Lighting.DescendantAdded:Connect(function(inst)
-            if not State.fpsBoostEnabled then
-                return
-            end
-
-            task.defer(function()
-                if State.fpsBoostEnabled then
-                    VisualController.stripLightingVisual(inst)
-                end
-            end)
-        end))
-    else
-        VisualController.restore()
-    end
-
-    MovementController.syncHoldState()
-end
-
-function FarmController.isEnabled()
-    return State.farmMode ~= "none"
-end
-
-function FarmController.clearTarget()
-    State.activeTarget = nil
-    State.activeTargetBaseName = nil
-    State.activeTargetKind = "None"
-    State.activeTargetLockCF = nil
-    State.lastLockCFRefreshAt = 0
-    State.LastTarget = "None"
-end
-
-function FarmController.setSpawnTarget(baseName, spawnCF, kindLabel)
-    State.activeTarget = nil
-    State.activeTargetBaseName = tostring(baseName or "Spawn")
-    State.activeTargetKind = kindLabel or "Spawn"
-    State.activeTargetLockCF = spawnCF
-    State.lastLockCFRefreshAt = os.clock()
-    State.LastTarget = tostring(baseName or "Spawn") .. " (spawn)"
-end
-
-function FarmController.setMode(mode)
-    mode = tostring(mode or "none")
-
-    if not MODE_LABELS[mode] then
-        mode = "none"
-    end
-
-    State.farmMode = mode
-    State.LastMode = MODE_LABELS[mode]
-
-    Config.FarmAllSelected = mode == "all"
-    Config.FarmingEnemies = mode == "mobs"
-    Config.FarmingBosses = mode == "bosses"
-    Config.FarmTimedBosses = mode == "timed"
-
-    if mode == "none" then
-        FarmController.clearTarget()
-    else
-        State.lastTargetRefreshAt = 0
-    end
-
-    MovementController.syncHoldState()
-end
-
-function FarmController.invalidateTargetIfNeeded()
-    if State.activeTarget and not FarmController.isCandidateAllowed(State.activeTarget) then
-        FarmController.clearTarget()
-    end
-end
-
-function FarmController.isCandidateAllowed(npc)
-    if not FarmController.isEnabled() then
-        return false
-    end
-
-    if not NPCController.isValid(npc) then
-        return false
-    end
-
-    local baseName = NPCController.getBaseName(npc.Name)
-    local isBoss = NPCController.isBossName(npc.Name)
-    local isTimedBoss = TIMED_BOSS_LOOKUP[npc.Name] == true
-    local selectedMobsCount = countEnabled(Config.SelectedEnemies)
-    local selectedBossCount = countEnabled(Config.SelectedBosses)
-
-    if State.farmMode == "timed" then
-        return isTimedBoss
-    end
-
-    if State.farmMode == "mobs" then
-        return not isBoss and (selectedMobsCount == 0 or Config.SelectedEnemies[baseName] == true)
-    end
-
-    if State.farmMode == "bosses" then
-        return isBoss and (selectedBossCount == 0 or Config.SelectedBosses[baseName] == true)
-    end
-
-    if State.farmMode == "all" then
-        if isBoss then
-            return selectedBossCount == 0 or Config.SelectedBosses[baseName] == true
-        end
-
-        return selectedMobsCount == 0 or Config.SelectedEnemies[baseName] == true
-    end
-
-    return false
-end
-
-function FarmController.shouldKeepTarget(npc)
-    return npc ~= nil and FarmController.isCandidateAllowed(npc)
-end
-
-function FarmController.getTargetKind(npc)
-    if not npc then
-        return "None"
-    end
-
-    if TIMED_BOSS_LOOKUP[npc.Name] then
-        return "Timed Boss"
-    end
-
-    if NPCController.isBossName(npc.Name) then
-        return "Boss"
-    end
-
-    return "Mob"
-end
-
-function FarmController.pickClosest(candidates)
-    return FarmController.pickClosestExcluding(candidates, nil)
-end
-
-function FarmController.pickClosestExcluding(candidates, exclude)
-    local bestNPC = nil
-    local bestDistance = math.huge
-
-    for _, npc in ipairs(candidates) do
-        if npc ~= exclude then
-        local distance = NPCController.getDistanceFromCharacter(npc)
-
-        if distance < bestDistance then
-            bestDistance = distance
-            bestNPC = npc
-        end
-        end
-    end
-
-    return bestNPC
-end
-
-function FarmController.acquireTarget(forceRefresh, exclude)
-    NPCController.refreshCache(forceRefresh)
-
-    local timedCandidates = {}
-    local regularCandidates = {}
-
-    -- Infinite range: prefer teleporting to the map's spawn/model position for selected targets,
-    -- even if some NPCs are currently nearby/replicated.
-    if Config.InfiniteRangeTP then
-        local bestCF = nil
-        local bestName = nil
-        local bestDist = math.huge
-
-        local function considerSelectionForCF(map)
-            for name, enabled in pairs(map) do
-                if enabled then
-                    local cf = NPCController.findModelCFrameForBaseName(name) or NPCController.findSpawnCFrameForBaseName(name)
-                    if cf and refreshCharacterRefs() and hrp then
-                        local d = (hrp.Position - cf.Position).Magnitude
-                        if d < bestDist then
-                            bestDist = d
-                            bestCF = cf
-                            bestName = name
-                        end
-                    end
-                end
-            end
-        end
-
-        if State.farmMode == "mobs" then
-            considerSelectionForCF(Config.SelectedEnemies)
-        elseif State.farmMode == "bosses" then
-            considerSelectionForCF(Config.SelectedBosses)
-        elseif State.farmMode == "all" then
-            considerSelectionForCF(Config.SelectedEnemies)
-            considerSelectionForCF(Config.SelectedBosses)
-        elseif State.farmMode == "timed" then
-            for _, timedName in ipairs(TIMED_BOSS_NAMES) do
-                local cf = NPCController.findModelCFrameForBaseName(timedName) or NPCController.findSpawnCFrameForBaseName(timedName)
-                if cf and refreshCharacterRefs() and hrp then
-                    local d = (hrp.Position - cf.Position).Magnitude
-                    if d < bestDist then
-                        bestDist = d
-                        bestCF = cf
-                        bestName = timedName
-                    end
-                end
-            end
-        end
-
-        if bestCF and bestName then
-            FarmController.clearTarget()
-            FarmController.setSpawnTarget(bestName, bestCF, "Spawn")
-            State.lastTargetRefreshAt = os.clock()
-            return nil
-        end
-    end
-
-    if State.farmMode == "timed" then
-        for _, npc in ipairs(NPCController.getTimedBosses(false)) do
-            if FarmController.isCandidateAllowed(npc) then
-                table.insert(timedCandidates, npc)
-            end
-        end
-    else
-        for _, npc in ipairs(NPCController.getValidNPCs(false)) do
-            if FarmController.isCandidateAllowed(npc) then
-                if TIMED_BOSS_LOOKUP[npc.Name] and State.farmMode ~= "mobs" then
-                    table.insert(timedCandidates, npc)
-                else
-                    table.insert(regularCandidates, npc)
-                end
-            end
-        end
-    end
-
-    local nextTarget = nil
-
-    if #timedCandidates > 0 then
-        nextTarget = FarmController.pickClosestExcluding(timedCandidates, exclude)
-    elseif #regularCandidates > 0 then
-        nextTarget = FarmController.pickClosestExcluding(regularCandidates, exclude)
-    else
-        for _, npc in ipairs(NPCController.getListableNPCs()) do
-            if npc ~= exclude and FarmController.isCandidateAllowed(npc) and MovementController.getTargetCFrameForNPC(npc) then
-                nextTarget = npc
-                break
-            end
-        end
-    end
-
-    if not nextTarget and exclude ~= nil then
-        return FarmController.acquireTarget(forceRefresh, nil)
-    end
-
-    if nextTarget then
-        State.activeTarget = nextTarget
-        State.activeTargetBaseName = NPCController.getBaseName(nextTarget.Name)
-        State.activeTargetKind = FarmController.getTargetKind(nextTarget)
-        State.activeTargetLockCF = nil
-        State.lastLockCFRefreshAt = 0
-        State.LastTarget = nextTarget.Name
-    else
-        FarmController.clearTarget()
-
-        -- Streaming fallback: if the NPC model isn't replicated yet, try teleporting to a spawn marker.
-        -- Only works when the user has selected targets (we need a name to search).
-        local bestSpawnCF = nil
-        local bestSpawnName = nil
-        local bestDist = math.huge
-
-        local function considerSelection(map)
-            for name, enabled in pairs(map) do
-                if enabled then
-                    local cf = NPCController.findSpawnCFrameForBaseName(name) or NPCController.findModelCFrameForBaseName(name)
-                    if cf and refreshCharacterRefs() and hrp then
-                        local d = (hrp.Position - cf.Position).Magnitude
-                        if d < bestDist then
-                            bestDist = d
-                            bestSpawnCF = cf
-                            bestSpawnName = name
-                        end
-                    end
-                end
-            end
-        end
-
-        if State.farmMode == "mobs" then
-            considerSelection(Config.SelectedEnemies)
-        elseif State.farmMode == "bosses" then
-            considerSelection(Config.SelectedBosses)
-        elseif State.farmMode == "all" then
-            considerSelection(Config.SelectedEnemies)
-            considerSelection(Config.SelectedBosses)
-        elseif State.farmMode == "timed" then
-            -- timed bosses are hardcoded names; try those as spawn keys
-            for _, timedName in ipairs(TIMED_BOSS_NAMES) do
-                local cf = NPCController.findSpawnCFrameForBaseName(timedName) or NPCController.findModelCFrameForBaseName(timedName)
-                if cf and refreshCharacterRefs() and hrp then
-                    local d = (hrp.Position - cf.Position).Magnitude
-                    if d < bestDist then
-                        bestDist = d
-                        bestSpawnCF = cf
-                        bestSpawnName = timedName
-                    end
-                end
-            end
-        end
-
-        if bestSpawnCF then
-            FarmController.setSpawnTarget(bestSpawnName, bestSpawnCF, "Spawn")
-        end
-    end
-
-    State.lastTargetRefreshAt = os.clock()
-    return nextTarget
-end
-
-function FarmController.refreshTargetLock(force)
-    if not State.activeTarget then
-        return State.activeTargetLockCF
-    end
-
-    if not FarmController.shouldKeepTarget(State.activeTarget) then
-        return nil
-    end
-
-    local now = os.clock()
-
-    if force or not State.activeTargetLockCF or (now - State.lastLockCFRefreshAt) >= INTERNAL.TARGET_CF_REFRESH then
-        State.activeTargetLockCF = MovementController.getTargetCFrameForNPC(State.activeTarget)
-        State.lastLockCFRefreshAt = now
-    end
-
-    return State.activeTargetLockCF
-end
-
-function FarmController.getStepDelay(hasTargetLock)
-    if hasTargetLock then
-        return math.max(INTERNAL.FARM_TICK_MIN, tonumber(Config.TPDelay) or 0)
-    end
-    return INTERNAL.TARGET_LOST_TICK
-end
-
-function FarmController.step()
-    local acquiredNewTarget = false
-
-    for attempt = 1, 2 do
-        acquiredNewTarget = false
-
-        if not FarmController.isEnabled() then
-            FarmController.clearTarget()
-            MovementController.syncHoldState()
-            return INTERNAL.IDLE_TICK
-        end
-
-        if not refreshCharacterRefs() or not hum or not hrp or hum.Health <= 0 then
-            MovementController.syncHoldState()
-            return INTERNAL.IDLE_TICK
-        end
-
-        if not State.connections.NoClip or not State.connections.NoClipDesc then
-            CharacterController.enableNoClip()
-        end
-
-        if State.activeTarget and not FarmController.shouldKeepTarget(State.activeTarget) then
-            local died = not NPCController.isAlive(State.activeTarget)
-            FarmController.clearTarget()
-
-            if died then
-                State.lastKillAt = os.clock()
-                MovementController.setHoldState(false)
-                MovementController.syncHoldState()
-
-                local delayAfterKill = math.max(0, tonumber(Config.Delay) or 0)
-                if delayAfterKill > 0 then
-                    return delayAfterKill
-                end
-            end
-        end
-
-        if not State.activeTarget and not State.activeTargetLockCF then
-            FarmController.acquireTarget(true, State.lastCycleSkip)
-            acquiredNewTarget = State.activeTarget ~= nil or State.activeTargetLockCF ~= nil
-        elseif State.activeTarget and (os.clock() - State.lastTargetRefreshAt) >= INTERNAL.NPC_CACHE_TTL then
-            NPCController.refreshCache(true)
-            State.lastTargetRefreshAt = os.clock()
-
-            if not FarmController.shouldKeepTarget(State.activeTarget) then
-                FarmController.clearTarget()
-                FarmController.acquireTarget(false, State.lastCycleSkip)
-                acquiredNewTarget = State.activeTarget ~= nil or State.activeTargetLockCF ~= nil
-            end
-        end
-
-        if State.activeTarget and Config.CycleTargets then
-            local now = os.clock()
-            local interval = math.clamp(tonumber(Config.CycleInterval) or 2.5, 0.35, 30)
-            if (now - (State.lastCycleAt or 0)) >= interval then
-                State.lastCycleAt = now
-                State.lastCycleSkip = State.activeTarget
-                FarmController.clearTarget()
-                FarmController.acquireTarget(true, State.lastCycleSkip)
-                acquiredNewTarget = State.activeTarget ~= nil or State.activeTargetLockCF ~= nil
-            end
-        end
-
-        local targetCF = FarmController.refreshTargetLock(acquiredNewTarget)
-
-        if not targetCF and State.activeTargetLockCF then
-            targetCF = State.activeTargetLockCF
-        end
-
-        if not targetCF then
-            MovementController.syncHoldState()
-            return INTERNAL.TARGET_LOST_TICK
-        end
-
-        if Config.AutoEquip then
-            EquipController.equipSelected(false)
-        end
-
-        if acquiredNewTarget then
-            MovementController.setHoldState(false)
-            MovementController.safePivotTo(targetCF, true)
-        else
-            MovementController.moveToward(targetCF)
-        end
-
-        if MovementController.shouldUseHold() then
-            MovementController.setHoldState(true, targetCF)
-        elseif State.holdEnabled then
-            MovementController.setHoldState(false)
-        end
-
-        CombatController.tryActivateTool()
-
-        if State.holdEnabled then
-            MovementController.updateHoldTarget(targetCF)
-        end
-
-        if State.activeTarget and not NPCController.isAlive(State.activeTarget) then
-            FarmController.clearTarget()
-            MovementController.setHoldState(false)
-            MovementController.syncHoldState()
-
-            local delayAfterKill = math.max(0, tonumber(Config.Delay) or 0)
-            if delayAfterKill > 0 then
-                State.lastKillAt = os.clock()
-                return delayAfterKill
-            end
-
-            if attempt < 2 then
-                continue
-            end
-        end
-
-        return FarmController.getStepDelay(true)
-    end
-
-    return INTERNAL.TARGET_LOST_TICK
-end
-
-function UIController.refreshNPCDropdowns(force)
-    local enemyDropdown = State.ui.EnemyDropdown
-    local bossDropdown = State.ui.BossDropdown
-
-    if enemyDropdown then
-        enemyDropdown:Refresh(NPCController.getGroupedList(false, force))
-    end
-
-    if bossDropdown then
-        bossDropdown:Refresh(NPCController.getGroupedList(true, force))
-    end
-end
-
-function UIController.addThemes()
-    WindUI:AddTheme({
-        Name = "Midnight Emerald",
-        Accent = WindUI:Gradient({
-            ["0"] = { Color = Color3.fromHex("#0f172a"), Transparency = 0 },
-            ["100"] = { Color = Color3.fromHex("#111827"), Transparency = 0 },
-        }, {
-            Rotation = 0,
-        }),
-        Background = Color3.fromHex("#08111f"),
-        Outline = Color3.fromHex("#1f3a5f"),
-        Text = Color3.fromHex("#e5f4ff"),
-        Placeholder = Color3.fromHex("#7f98b5"),
-        Button = WindUI:Gradient({
-            ["0"] = { Color = Color3.fromHex("#0d9488"), Transparency = 0 },
-            ["100"] = { Color = Color3.fromHex("#22c55e"), Transparency = 0 },
-        }, {
-            Rotation = 30,
-        }),
-        Icon = Color3.fromHex("#bbf7d0"),
-    })
-
-    WindUI:AddTheme({
-        Name = "Crimson Night",
-        Accent = Color3.fromHex("#121117"),
-        Background = Color3.fromHex("#0b0a0f"),
-        Outline = Color3.fromHex("#42243a"),
-        Text = Color3.fromHex("#ffe4ef"),
-        Placeholder = Color3.fromHex("#b48aa0"),
-        Button = WindUI:Gradient({
-            ["0"] = { Color = Color3.fromHex("#7f1d1d"), Transparency = 0 },
-            ["100"] = { Color = Color3.fromHex("#db2777"), Transparency = 0 },
-        }, {
-            Rotation = 25,
-        }),
-        Icon = Color3.fromHex("#fda4af"),
-    })
-
-    WindUI:AddTheme({
-        Name = "Nebula Orbit",
-        Accent = WindUI:Gradient({
-            ["0"] = { Color = Color3.fromHex("#050816"), Transparency = 0 },
-            ["100"] = { Color = Color3.fromHex("#0b122e"), Transparency = 0 },
-        }, {
-            Rotation = 15,
-        }),
-        Background = Color3.fromHex("#04050b"),
-        Outline = Color3.fromHex("#223a73"),
-        Text = Color3.fromHex("#e8efff"),
-        Placeholder = Color3.fromHex("#93a8d9"),
-        Button = WindUI:Gradient({
-            ["0"] = { Color = Color3.fromHex("#1d4ed8"), Transparency = 0 },
-            ["100"] = { Color = Color3.fromHex("#06b6d4"), Transparency = 0 },
-        }, {
-            Rotation = 35,
-        }),
-        Icon = Color3.fromHex("#93c5fd"),
-    })
-end
-
-function UIController.create()
-    UIController.addThemes()
-
-    local window = WindUI:CreateWindow({
-        Title = "Lapo Hub - Sailor Piece",
-        Icon = "swords",
-        Author = "Luau Refactor",
-        Folder = "LapoHubSailorPiece",
-        Size = UDim2.fromOffset(610, 470),
-        MinSize = Vector2.new(580, 420),
-        MaxSize = Vector2.new(900, 620),
-        ToggleKey = Enum.KeyCode.RightShift,
-        Transparent = true,
-        Theme = "Dark",
-        Resizable = true,
-        SideBarWidth = 210,
-        BackgroundImageTransparency = 0.82,
-        User = {
-            Enabled = true,
-            Anonymous = true,
-            Callback = function()
-                notify("Profile", "Top-right profile is active.", "user-round", 3)
-            end,
-        },
-        OpenButton = {
-            Title = "Open Lapo Hub",
-            CornerRadius = UDim.new(1, 0),
-            StrokeThickness = 2,
-            Enabled = true,
-            OnlyMobile = true,
-            Color = ColorSequence.new(
-                Color3.fromHex("#0d9488"),
-                Color3.fromHex("#22c55e")
-            ),
-        },
-    })
-
-    State.ui.Window = window
-
-    WindUI:SetTheme(Config.ThemeName)
-    window:SetIconSize(28)
-    window:Tag({ Title = "Sailor Piece", Color = Color3.fromHex("#22c55e") })
-    window:Tag({ Title = "Mobile", Color = Color3.fromHex("#38bdf8") })
-
-    window:CreateTopbarButton("theme-switch", "moon", function()
-        local currentTheme = WindUI:GetCurrentTheme()
-        local nextTheme = currentTheme == "Dark" and "Midnight Emerald" or "Dark"
-
-        WindUI:SetTheme(nextTheme)
-        Config.ThemeName = nextTheme
-
-        notify("Theme Changed", nextTheme, "palette", 2)
-    end, 990)
-
-    local HomeTab = window:Tab({ Title = "Home", Icon = "house" })
-    local FarmTab = window:Tab({ Title = "Farm", Icon = "crosshair" })
-    local CombatTab = window:Tab({ Title = "Combat", Icon = "swords" })
-    local VisualTab = window:Tab({ Title = "Visual", Icon = "monitor-smartphone" })
-    local UITab = window:Tab({ Title = "UI", Icon = "palette" })
-    local ConfigTab = window:Tab({ Title = "Config", Icon = "settings-2" })
-
-    HomeTab:Paragraph({
-        Title = "Lapo Hub - Sailor Piece",
-        Desc = "Base preservada com alvo sticky, teleporte mais estável, air hold único e FPS boost agressivo mais seguro.",
-        Image = "sparkles",
-        ImageSize = 20,
-        Color = "White",
-    })
-
-    HomeTab:Divider()
-
-    State.ui.StatusParagraph = HomeTab:Paragraph({
-        Title = "Live Status",
-        Desc = "Waiting for status...",
-        Image = "activity",
-        ImageSize = 20,
-        Color = "Grey",
-        Buttons = {
-            {
-                Title = "Equip now",
-                Icon = "sword",
-                Callback = function()
-                    local ok = EquipController.equipSelected(true)
-                    notify(
-                        ok and "Equipped" or "Equip failed",
-                        ok and tostring(State.LastEquipped) or ("Could not equip " .. tostring(Config.EquipLabel)),
-                        ok and "check" or "x",
-                        3
-                    )
-                end,
-            },
-            {
-                Title = "TP nearest NPC (debug)",
-                Icon = "crosshair",
-                Callback = function()
-                    local npc, dist = NPCController.findNearestValidAny()
-                    if not npc then
-                        notify("TP Debug", "No valid NPC found in workspace.", "x", 4)
-                        return
-                    end
-
-                    local cf = MovementController.getTargetCFrameForNPC(npc)
-                    if not cf then
-                        notify("TP Debug", "Nearest NPC has no valid CFrame: " .. tostring(npc.Name), "x", 4)
-                        return
-                    end
-
-                    MovementController.setHoldState(false)
-                    local moved = MovementController.safePivotTo(cf, true)
-                    notify(
-                        "TP Debug",
-                        (moved and "Teleported to " or "Teleport skipped to ")
-                            .. tostring(npc.Name)
-                            .. " (dist "
-                            .. string.format("%.1f", tonumber(dist) or 0)
-                            .. ")",
-                        moved and "check" or "triangle-alert",
-                        4
-                    )
-                end,
-            },
-            {
-                Title = "Refresh NPCs",
-                Icon = "refresh-cw",
-                Callback = function()
-                    UIController.refreshNPCDropdowns(true)
-                    notify("NPC Lists", "Dropdowns updated.", "refresh-cw", 2)
-                end,
-            },
-        },
-    })
-
-    local quickInfo = HomeTab:Section({
-        Title = "Quick Notes",
-        Box = true,
-        Opened = true,
-        TextXAlignment = "Center",
-    })
-
-    quickInfo:Paragraph({
-        Title = "What changed",
-        Desc = "Farm mais leve, alvo mais consistente, menos spam de movimento e auto equip com throttle e fallback.",
-        Image = "wand-sparkles",
-        ImageSize = 18,
-        Color = "White",
-    })
-
-    local farmMainSection = FarmTab:Section({
-        Title = "Farm Modes",
-        Box = true,
-        Opened = true,
-        TextXAlignment = "Center",
-    })
-
-    farmMainSection:Toggle({
-        Title = "Farm All Selected",
-        Desc = "Farm every selected mob and boss",
-        Value = false,
-        Flag = "farm_all_selected",
-        Callback = function(state)
-            if state then
-                FarmController.setMode("all")
-            elseif Config.FarmAllSelected then
-                FarmController.setMode("none")
-            end
-        end,
-    })
-
-    farmMainSection:Toggle({
-        Title = "Auto Farm Mobs Only",
-        Desc = "Only normal mobs",
-        Value = false,
-        Flag = "farm_mobs_only",
-        Callback = function(state)
-            if state then
-                FarmController.setMode("mobs")
-            elseif Config.FarmingEnemies then
-                FarmController.setMode("none")
-            end
-        end,
-    })
-
-    farmMainSection:Toggle({
-        Title = "Auto Farm Bosses Only",
-        Desc = "Only bosses",
-        Value = false,
-        Flag = "farm_bosses_only",
-        Callback = function(state)
-            if state then
-                FarmController.setMode("bosses")
-            elseif Config.FarmingBosses then
-                FarmController.setMode("none")
-            end
-        end,
-    })
-
-    farmMainSection:Toggle({
-        Title = "Only Timed Bosses",
-        Desc = "Always prioritize timed bosses",
-        Value = false,
-        Flag = "farm_timed_bosses",
-        Callback = function(state)
-            if state then
-                FarmController.setMode("timed")
-            elseif Config.FarmTimedBosses then
-                FarmController.setMode("none")
-            end
-        end,
-    })
-
-    farmMainSection:Slider({
-        Title = "Teleport Delay",
-        Desc = "Real delay between repositions",
-        Step = 0.005,
-        Value = { Min = 0, Max = 0.25, Default = Config.TPDelay },
-        Flag = "tp_delay",
-        Callback = function(value)
-            Config.TPDelay = value
-        end,
-    })
-
-    farmMainSection:Slider({
-        Title = "Post Kill Delay",
-        Desc = "Agora aplica de verdade",
-        Step = 0.01,
-        Value = { Min = 0, Max = 1, Default = Config.Delay },
-        Flag = "post_kill_delay",
-        Callback = function(value)
-            Config.Delay = value
-        end,
-    })
-
-    local farmSelectSection = FarmTab:Section({
-        Title = "Target Selection",
-        Box = true,
-        Opened = true,
-        TextXAlignment = "Center",
-    })
-
-    State.ui.EnemyDropdown = farmSelectSection:Dropdown({
-        Title = "Select Mobs",
-        Desc = "Grouped by base name",
-        Values = NPCController.getGroupedList(false, true),
-        Value = {},
-        Multi = true,
-        AllowNone = true,
-        SearchBarEnabled = true,
-        Flag = "selected_mobs",
-        Callback = function(selected)
-            Config.SelectedEnemies = {}
-
-            for _, name in ipairs(selected) do
-                Config.SelectedEnemies[name] = true
-            end
-
-            FarmController.invalidateTargetIfNeeded()
-        end,
-    })
-
-    State.ui.BossDropdown = farmSelectSection:Dropdown({
-        Title = "Select Bosses",
-        Desc = "Boss suffix and timed bosses",
-        Values = NPCController.getGroupedList(true, true),
-        Value = {},
-        Multi = true,
-        AllowNone = true,
-        SearchBarEnabled = true,
-        Flag = "selected_bosses",
-        Callback = function(selected)
-            Config.SelectedBosses = {}
-
-            for _, name in ipairs(selected) do
-                Config.SelectedBosses[name] = true
-            end
-
-            FarmController.invalidateTargetIfNeeded()
-        end,
-    })
-
-    farmSelectSection:Button({
-        Title = "Reload NPC Lists",
-        Icon = "refresh-cw",
-        Callback = function()
-            UIController.refreshNPCDropdowns(true)
-            notify("Lists refreshed", "Updated mob and boss dropdowns.", "refresh-cw", 2)
-        end,
-    })
-
-    local combatSection = CombatTab:Section({
-        Title = "Teleport & Character",
-        Box = true,
-        Opened = true,
-        TextXAlignment = "Center",
-    })
-
-    combatSection:Toggle({
-        Title = "Air Hold",
-        Desc = "Mantém você parado no ar durante o farm, sem ancorar o personagem",
-        Value = true,
-        Flag = "air_hold",
-        Callback = function(state)
-            Config.StaticMode = state
-            MovementController.syncHoldState()
-        end,
-    })
-
-    combatSection:Toggle({
-        Title = "Bypass TP",
-        Desc = "Uses small mid-steps on long teleports",
-        Value = Config.BypassTP,
-        Flag = "bypass_tp",
-        Callback = function(state)
-            Config.BypassTP = state
-        end,
-    })
-
-    combatSection:Slider({
-        Title = "Distance Behind NPC",
-        Step = 0.5,
-        Value = { Min = 1, Max = 10, Default = Config.DistanceBehind },
-        Flag = "distance_behind",
-        Callback = function(value)
-            Config.DistanceBehind = value
-        end,
-    })
-
-    combatSection:Slider({
-        Title = "Height Offset",
-        Step = 0.5,
-        Value = { Min = -2, Max = 10, Default = Config.HeightOffset },
-        Flag = "height_offset",
-        Callback = function(value)
-            Config.HeightOffset = value
-        end,
-    })
-
-    combatSection:Toggle({
-        Title = "Pack Center TP",
-        Desc = "Mira no centro do pack em vez de um NPC isolado",
-        Value = Config.PreferPackCenter,
-        Flag = "pack_center_tp",
-        Callback = function(state)
-            Config.PreferPackCenter = state
-        end,
-    })
-
-    combatSection:Toggle({
-        Title = "Orbit Pack",
-        Desc = "Fica rodando no pack pra skill pegar todos",
-        Value = Config.PackOrbit,
-        Flag = "pack_orbit",
-        Callback = function(state)
-            Config.PackOrbit = state
-        end,
-    })
-
-    combatSection:Slider({
-        Title = "Orbit Radius",
-        Step = 0.25,
-        Value = { Min = 1.5, Max = 12, Default = Config.OrbitRadius },
-        Flag = "orbit_radius",
-        Callback = function(value)
-            Config.OrbitRadius = value
-        end,
-    })
-
-    combatSection:Slider({
-        Title = "Orbit Speed",
-        Step = 0.1,
-        Value = { Min = 0.2, Max = 6, Default = Config.OrbitSpeed },
-        Flag = "orbit_speed",
-        Callback = function(value)
-            Config.OrbitSpeed = value
-        end,
-    })
-
-    combatSection:Slider({
-        Title = "Extra Orbit Height",
-        Step = 0.25,
-        Value = { Min = -3, Max = 6, Default = Config.OrbitHeight },
-        Flag = "orbit_height",
-        Callback = function(value)
-            Config.OrbitHeight = value
-        end,
-    })
-
-    local weaponSection = CombatTab:Section({
-        Title = "Auto Equip Weapon",
-        Box = true,
-        Opened = true,
-        TextXAlignment = "Center",
-    })
-
-    weaponSection:Dropdown({
-        Title = "Weapon Slot",
-        Desc = "1 = Melee, 2 = Sword, 3 = Fruit",
-        Values = { SLOT_INFO[1].Label, SLOT_INFO[2].Label, SLOT_INFO[3].Label },
-        Value = SLOT_INFO[1].Label,
-        SearchBarEnabled = false,
-        Flag = "weapon_slot",
-        Callback = function(option)
-            EquipController.setSelection(option)
-        end,
-    })
-
-    weaponSection:Toggle({
-        Title = "Auto Equip Selected Slot",
-        Desc = "Keeps the selected slot active while farming",
-        Value = false,
-        Flag = "auto_equip_weapon",
-        Callback = function(state)
-            Config.AutoEquip = state
-
-            if state then
-                EquipController.equipSelected(true)
-            end
-        end,
-    })
-
-    weaponSection:Toggle({
-        Title = "Auto Attack",
-        Desc = "Activates equipped tool while farming",
-        Value = true,
-        Flag = "auto_attack",
-        Callback = function(state)
-            Config.AutoAttack = state
-        end,
-    })
-
-    weaponSection:Slider({
-        Title = "Attack Delay",
-        Desc = "How fast to activate the tool",
-        Step = 0.005,
-        Value = { Min = 0, Max = 0.3, Default = Config.AttackDelay },
-        Flag = "attack_delay",
-        Callback = function(value)
-            Config.AttackDelay = value
-        end,
-    })
-
-    weaponSection:Toggle({
-        Title = "Cycle Targets",
-        Desc = "Switch NPC target every X seconds (even if not dead)",
-        Value = Config.CycleTargets,
-        Flag = "cycle_targets",
-        Callback = function(state)
-            Config.CycleTargets = state
-            State.lastCycleAt = 0
-            State.lastCycleSkip = nil
-        end,
-    })
-
-    weaponSection:Slider({
-        Title = "Cycle Interval",
-        Desc = "Seconds before switching target",
-        Step = 0.1,
-        Value = { Min = 0.35, Max = 30, Default = Config.CycleInterval },
-        Flag = "cycle_interval",
-        Callback = function(value)
-            Config.CycleInterval = value
-        end,
-    })
-
-    weaponSection:Button({
-        Title = "Force Equip Now",
-        Icon = "sword",
-        Callback = function()
-            local ok = EquipController.equipSelected(true)
-            notify(
-                ok and "Weapon equipped" or "Equip failed",
-                ok and tostring(State.LastEquipped) or ("Could not equip " .. tostring(Config.EquipLabel)),
-                ok and "check" or "x",
-                3
-            )
-        end,
-    })
-
-    local visualSection = VisualTab:Section({
-        Title = "FPS Boost",
-        Box = true,
-        Opened = true,
-        TextXAlignment = "Center",
-    })
-
-    visualSection:Paragraph({
-        Title = "Workspace cleaner (local)",
-        Desc = "Oculta localmente quase tudo do mapa, preservando personagens, NPCs, terrain e restauração quando desligado.",
-        Image = "monitor-up",
-        ImageSize = 18,
-        Color = "White",
-    })
-
-    visualSection:Toggle({
-        Title = "FPS BOOST",
-        Desc = "Remove localmente quase tudo da Workspace (exceto personagens e NPCs)",
-        Value = false,
-        Flag = "fps_boost",
-        Callback = function(state)
-            Config.FPSBoost = state
-            VisualController.apply(state)
-
-            notify(
-                state and "FPS Boost enabled" or "FPS Boost disabled",
-                state and "Visuals stripped locally." or "Visuals restored.",
-                state and "zap" or "undo-2",
-                3
-            )
-        end,
-    })
-
-    visualSection:Toggle({
-        Title = "Air Hold During FPS Boost",
-        Desc = "Mantém você parado no ar se o cenário estiver invisível",
-        Value = true,
-        Flag = "freeze_fpsboost",
-        Callback = function(state)
-            Config.FreezeOnFPSBoost = state
-            MovementController.syncHoldState()
-        end,
-    })
-
-    local appearanceSection = UITab:Section({
-        Title = "Appearance",
-        Box = true,
-        Opened = true,
-        TextXAlignment = "Center",
-    })
-
-    local themeNames = {}
-    for themeName, _ in pairs(WindUI:GetThemes()) do
-        table.insert(themeNames, themeName)
-    end
-    table.sort(themeNames)
-
-    State.ui.ThemeDropdown = appearanceSection:Dropdown({
-        Title = "Theme",
-        Values = themeNames,
-        Value = Config.ThemeName,
-        SearchBarEnabled = true,
-        Flag = "theme_select",
-        Callback = function(theme)
-            Config.ThemeName = theme
-            WindUI:SetTheme(theme)
-            notify("Theme Applied", tostring(theme), "palette", 2)
-        end,
-    })
-
-    appearanceSection:Slider({
-        Title = "Window Transparency",
-        Step = 0.05,
-        Value = { Min = 0, Max = 1, Default = 0.15 },
-        Flag = "window_transparency",
-        Callback = function(value)
-            window:SetBackgroundTransparency(value)
-            window:SetBackgroundImageTransparency(math.clamp(value + 0.1, 0, 1))
-        end,
-    })
-
-    appearanceSection:Button({
-        Title = "Dark / Light Quick Toggle",
-        Icon = "sun-moon",
-        Callback = function()
-            local nextTheme = WindUI:GetCurrentTheme() == "Dark" and "Light" or "Dark"
-            WindUI:SetTheme(nextTheme)
-
-            if State.ui.ThemeDropdown then
-                State.ui.ThemeDropdown:Select(nextTheme)
-            end
-        end,
-    })
-
-    local mobileSection = UITab:Section({
-        Title = "Mobile UX",
-        Box = true,
-        Opened = true,
-        TextXAlignment = "Center",
-    })
-
-    mobileSection:Paragraph({
-        Title = "OpenButton enabled",
-        Desc = "On mobile, a floating open button appears because OpenButton.OnlyMobile = true. On PC, use RightShift.",
-        Image = "smartphone",
-        ImageSize = 18,
-        Color = "Grey",
-    })
-
-    local configSection = ConfigTab:Section({
-        Title = "Save / Load",
-        Box = true,
-        Opened = true,
-        TextXAlignment = "Center",
-    })
-
-    local configManager = window.ConfigManager
-    local configFile = configManager and configManager:CreateConfig("main") or nil
-    State.ui.ConfigFile = configFile
-
-    configSection:Paragraph({
-        Title = "Config manager",
-        Desc = configFile and "Flags are ready. Save and load whenever you want." or "Your executor may not support ConfigManager.",
-        Image = configFile and "folder-check" or "triangle-alert",
-        ImageSize = 18,
-        Color = configFile and "White" or "Red",
-    })
-
-    configSection:Button({
-        Title = "Save Config",
-        Icon = "save",
-        Callback = function()
-            if not configFile then
-                notify("Config", "ConfigManager unavailable.", "x", 3)
-                return
-            end
-
-            local ok = configFile:Save()
-            notify(ok and "Saved" or "Save failed", ok and "Config saved as main.json" or "Could not save config.", ok and "check" or "x", 3)
-        end,
-    })
-
-    configSection:Button({
-        Title = "Load Config",
-        Icon = "folder-open",
-        Callback = function()
-            if not configFile then
-                notify("Config", "ConfigManager unavailable.", "x", 3)
-                return
-            end
-
-            local loaded = configFile:Load()
-
-            task.delay(0.1, function()
-                UIController.refreshNPCDropdowns(true)
-                MovementController.syncHoldState()
-                FarmController.invalidateTargetIfNeeded()
-            end)
-
-            notify(loaded and "Loaded" or "Load failed", loaded and "Config loaded from main.json" or "Could not load config.", loaded and "refresh-cw" or "x", 3)
-        end,
-    })
-
-    configSection:Button({
-        Title = "Delete Config",
-        Icon = "trash-2",
-        Callback = function()
-            if not configFile then
-                notify("Config", "ConfigManager unavailable.", "x", 3)
-                return
-            end
-
-            configFile:Delete()
-            notify("Deleted", "main.json removed.", "trash-2", 3)
-        end,
-    })
-
-    window:OnClose(function()
-        if State.ui.ConfigFile then
-            pcall(function()
-                State.ui.ConfigFile:Save()
-            end)
-        end
-    end)
-
-    window:OnDestroy(function()
-        State.alive = false
-        State.farmMode = "none"
-        State.LastMode = MODE_LABELS.none
-        Config.FarmAllSelected = false
-        Config.FarmingEnemies = false
-        Config.FarmingBosses = false
-        Config.FarmTimedBosses = false
-        Config.FPSBoost = false
-        State.fpsBoostEnabled = false
-
-        VisualController.restore()
-        MovementController.setHoldState(false)
-        CharacterController.stopNoClip()
-
-        if State.connections.CharacterAdded then
-            State.connections.CharacterAdded:Disconnect()
-            State.connections.CharacterAdded = nil
-        end
-    end)
-
-    HomeTab:Select()
-end
-
-function LifecycleController.onCharacterReady(newChar)
-    if not State.alive then
-        return
-    end
-
-    if not refreshCharacterRefs(newChar, true) then
-        return
-    end
-
-    CharacterController.enableNoClip()
-
-    task.delay(0.35, function()
-        if not State.alive then
-            return
-        end
-
-        refreshCharacterRefs(LocalPlayer.Character, true)
-        CharacterController.enableNoClip()
-
-        if Config.FPSBoost then
-            VisualController.apply(true)
-        else
-            MovementController.syncHoldState()
-        end
-
-        if Config.AutoEquip then
-            EquipController.equipSelected(true)
-        end
-    end)
-end
-
-function LifecycleController.start()
-    refreshCharacterRefs(LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait(), true)
-    CharacterController.enableNoClip()
-
-    if State.connections.CharacterAdded then
-        State.connections.CharacterAdded:Disconnect()
-    end
-
-    State.connections.CharacterAdded = LocalPlayer.CharacterAdded:Connect(function(newChar)
-        LifecycleController.onCharacterReady(newChar)
-    end)
-end
-
-function LifecycleController.startFarmLoop()
-    task.spawn(function()
-        while State.alive do
-            local waitTime = FarmController.step()
-            task.wait(waitTime or INTERNAL.IDLE_TICK)
-        end
-    end)
-end
-
-function LifecycleController.startStatusLoop()
-    task.spawn(function()
-        while State.alive do
-            NPCController.refreshCache(false)
-
-            local statusParagraph = State.ui.StatusParagraph
-            if statusParagraph then
-                local npcCount = #State.npcCache.models
-                local timedCount = #State.npcCache.timed
-                local selectedMobCount = countEnabled(Config.SelectedEnemies)
-                local selectedBossCount = countEnabled(Config.SelectedBosses)
-
-                local statusText = string.format(
-                    "Mode: %s\nTarget: %s\nTarget Type: %s\nEquip Slot: %s\nLast Equipped: %s\nAutoEquip: %s\nFPS Boost: %s\nNo Collision: %s\nAir Hold: %s\nNPCs loaded: %d\nTimed Bosses alive: %d\nSelected Mobs: %d\nSelected Bosses: %d\nTheme: %s",
-                    tostring(State.LastMode),
-                    tostring(State.LastTarget),
-                    tostring(State.activeTargetKind),
-                    tostring(Config.EquipLabel),
-                    tostring(State.LastEquipped),
-                    Config.AutoEquip and "ON" or "OFF",
-                    State.fpsBoostEnabled and "ON" or "OFF",
-                    State.connections.NoClip and "ON" or "OFF",
-                    State.holdEnabled and "ON" or "OFF",
-                    npcCount,
-                    timedCount,
-                    selectedMobCount,
-                    selectedBossCount,
-                    tostring(WindUI:GetCurrentTheme())
-                )
-
-                statusParagraph:SetDesc(statusText)
-            end
-
-            task.wait(INTERNAL.STATUS_REFRESH)
-        end
-    end)
-end
-
-LifecycleController.start()
-UIController.create()
-LifecycleController.startFarmLoop()
-LifecycleController.startStatusLoop()
-
-WindUI:OnThemeChange(function(theme)
-    Config.ThemeName = theme
 end)
 
-notify(
-    "Lapo Hub - Sailor Piece",
-    "Loaded with sticky target farm, stable movement, throttled auto equip and safe aggressive FPS boost.",
-    "sparkles",
-    5
-)
+State.Connections.NoClip = RunService.Stepped:Connect(function()
+    if not Config.NoClip or not State.Character then
+        return
+    end
+
+    for _, inst in ipairs(State.Character:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            inst.CanCollide = false
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        refreshTargetDropdown()
+        task.wait(2)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        if not State.Character or not State.Character.Parent or not State.Humanoid or not State.Root or State.Humanoid.Health <= 0 then
+            resetCharacter(LocalPlayer.Character)
+            task.wait(0.25)
+        else
+            local farming = Config.FarmMobs or Config.FarmBosses
+            local target = farming and resolveTarget() or nil
+
+            if target then
+                if Config.AutoEquip then
+                    tapEquipSlot()
+                end
+
+                teleportToTarget(target)
+                attack()
+
+                if Config.AirHold and State.Root then
+                    holdInAir(State.Root.CFrame)
+                end
+            else
+                State.Target = nil
+                State.TargetName = "None"
+
+                if Config.AirHold and State.Root then
+                    holdInAir(State.Root.CFrame)
+                else
+                    disableAirHold()
+                end
+            end
+
+            task.wait(Config.Delay)
+        end
+    end
+end)
