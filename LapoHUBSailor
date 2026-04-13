@@ -81,7 +81,7 @@ local INTERNAL = {
 local Config = {
     Delay = 0.45,
     TPDelay = 0.05,
-    BypassTP = true,
+    BypassTP = false,
     InfiniteRangeTP = true,
     AutoAttack = true,
     AttackDelay = 0.12,
@@ -428,8 +428,26 @@ function NPCController.findModelCFrameForBaseName(baseName)
         return nil
     end
 
-    local bestCF = nil
-    local bestDist = math.huge
+    local bestAnyCF = nil
+    local bestAnyDist = math.huge
+    local bestFiveCF = nil
+    local bestFiveDist = math.huge
+
+    local function computeModelCF(obj)
+        local root = NPCController.getRoot(obj)
+        if root then
+            return root.CFrame
+        end
+
+        local ok, pivot = pcall(function()
+            return obj:GetPivot()
+        end)
+        if ok and pivot then
+            return pivot
+        end
+
+        return nil
+    end
 
     for _, obj in ipairs(Workspace:GetDescendants()) do
         if obj:IsA("Model")
@@ -438,31 +456,26 @@ function NPCController.findModelCFrameForBaseName(baseName)
             and not Players:GetPlayerFromCharacter(obj)
         then
             if NPCController.normalizeKey(obj.Name) == key then
-                local cf = nil
-                local root = NPCController.getRoot(obj)
-                if root then
-                    cf = root.CFrame
-                else
-                    local ok, pivot = pcall(function()
-                        return obj:GetPivot()
-                    end)
-                    if ok and pivot then
-                        cf = pivot
-                    end
-                end
-
+                local cf = computeModelCF(obj)
                 if cf then
                     local d = (hrp.Position - cf.Position).Magnitude
-                    if d < bestDist then
-                        bestDist = d
-                        bestCF = cf
+                    local isFive = tostring(obj.Name):match("5$") ~= nil
+
+                    if isFive and d < bestFiveDist then
+                        bestFiveDist = d
+                        bestFiveCF = cf
+                    end
+
+                    if d < bestAnyDist then
+                        bestAnyDist = d
+                        bestAnyCF = cf
                     end
                 end
             end
         end
     end
 
-    return bestCF
+    return bestFiveCF or bestAnyCF
 end
 
 function NPCController.isBossName(name)
@@ -1846,7 +1859,7 @@ function FarmController.step()
 
         if died then
             MovementController.syncHoldState()
-            return Config.Delay
+            return (tonumber(Config.Delay) or 0) > 0 and Config.Delay or 0
         end
     end
 
@@ -1915,7 +1928,7 @@ function FarmController.step()
 
     if not NPCController.isAlive(State.activeTarget) then
         FarmController.clearTarget()
-        return Config.Delay
+        return (tonumber(Config.Delay) or 0) > 0 and Config.Delay or 0
     end
 
     return FarmController.getStepDelay(true)
